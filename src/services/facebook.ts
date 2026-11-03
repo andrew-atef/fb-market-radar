@@ -43,10 +43,14 @@ export interface Attachment {
   [key: string]: unknown;
 }
 
-/** Shape of the response from GET /{post-id}?fields=attachments{...}. */
+/** Shape of the response from GET /{post-id}?fields=attachments{...},child_attachments{...}. */
 export interface PostAttachmentsResponse {
   data: Array<{
     attachments?: Attachment;
+    /** Present on multi-media link shares. */
+    child_attachments?: {
+      data?: Array<{ media?: AttachmentMedia }>;
+    };
   }>;
   [key: string]: unknown;
 }
@@ -95,9 +99,9 @@ export async function shareToFacebookPage(
 
 /**
  * Fetches the full attachment graph for a shared post and extracts every
- * high-resolution image URL from subattachments (and top-level media).
+ * image URL from subattachments (and top-level media).
  *
- * GET https://graph.facebook.com/v23.0/{shared_post_id}?fields=attachments{media,subattachments.limit(50){media}}&access_token=...
+ * GET https://graph.facebook.com/v23.0/{shared_post_id}?fields=attachments{media,subattachments.limit(50){media}},child_attachments{media}&access_token=...
  *
  * @param env          - Worker environment bindings
  * @param sharedPostId - The shared post ID returned by the feed publish step
@@ -112,7 +116,7 @@ export async function fetchPostAttachments(
   const params = new URLSearchParams();
   params.set(
     "fields",
-    "attachments{media,subattachments.limit(50){media}}"
+    "attachments{media,subattachments.limit(50){media}},child_attachments{media}"
   );
   params.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
 
@@ -191,11 +195,20 @@ function extractImageUrls(data: PostAttachmentsResponse): string[] {
       images.push(attachment.media.image.src);
     }
 
-    // Subattachments (carousel / multi-image posts)
+    // Subattachments (album / multi-image posts)
     const subattachments = attachment.subattachments?.data ?? [];
     for (const sub of subattachments) {
       if (sub.media?.image?.src) {
         images.push(sub.media.image.src);
+      }
+    }
+  }
+
+  // child_attachments data (multi-media link shares)
+  for (const item of data.data ?? []) {
+    for (const child of item.child_attachments?.data ?? []) {
+      if (child.media?.image?.src) {
+        images.push(child.media.image.src);
       }
     }
   }

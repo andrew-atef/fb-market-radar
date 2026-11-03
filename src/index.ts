@@ -60,6 +60,17 @@ function hookLatencyMinutes(iso: string | null | undefined): number | null {
   return minutes;
 }
 
+/** Orders-preserving union of image URL lists (first occurrence wins). */
+function mergeUnique(...lists: string[][]): string[] {
+  const out: string[] = [];
+  for (const list of lists) {
+    for (const u of list) {
+      if (u && !out.includes(u)) out.push(u);
+    }
+  }
+  return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* Core Pipeline                                                      */
 /* ------------------------------------------------------------------ */
@@ -435,14 +446,35 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       // Still record the post — repro de-dupe must hold even if sharing failed.
     }
 
-    // --- Sanitize the extracted master image URLs ---
-    const imageUrls = Array.isArray(payload.imageUrls)
+    // --- Image pipeline ---
+    // Canonical source: the Graph API attachment graph of OUR OWN shared
+    // post (attachments/subattachments/child_attachments). These are the
+    // page-owned 720px renders that produce fbid photo URLs and survive
+    // attribute-independent DC routing. The SSR master URLs extracted by
+    // the scraper act as the fallback when the share carries no media.
+    const ssrImages = Array.isArray(payload.imageUrls)
       ? payload.imageUrls
           .filter(
             (u): u is string => typeof u === "string" && u.startsWith("http")
           )
           .slice(0, 20)
       : [];
+
+    let images: string[] = [];
+    if (sharedPostId) {
+      try {
+        const graphImages = await fetchPostAttachments(env, sharedPostId);
+        images = mergeUnique(graphImages, ssrImages).slice(0, 30);
+      } catch (attachErr) {
+        console.error(
+          `[hook] Failed to fetch shared-post attachments for ${sharedPostId}:`,
+          attachErr
+        );
+        images = ssrImages;
+      }
+    } else {
+      images = ssrImages;
+    }
 
     const publishedSql = isoToSqlDateTime(payload.publishedAt ?? null);
     const latency = hookLatencyMinutes(payload.publishedAt ?? null);
@@ -462,7 +494,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         null,
         postText || null,
         sharedPostId,
-        JSON.stringify(imageUrls),
+        JSON.stringify(images),
         publishedSql,
         null,
         latency
@@ -474,7 +506,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       duplicate: false,
       postId,
       sharedPostId,
-      imageCount: imageUrls.length,
+      imageCount: images.length,
+      imageSource: sharedPostId
+        ? "graph-attachments+ssr-fallback"
+        : "ssr-fallback",
       latencyMinutes: latency,
     });
   }
