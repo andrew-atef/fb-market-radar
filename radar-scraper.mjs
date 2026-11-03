@@ -39,18 +39,20 @@ if (!WORKER_URL || !WORKER_KEY) {
   process.exit(1);
 }
 
-/** The 10 monitored Egyptian supermarket Facebook pages. */
+/** The target Egyptian supermarket Facebook pages (12 — user-confirmed list). */
 const STORES = [
-  { slug: "kazyonegypt",        name: "Kazyon Egypt" },
-  { slug: "BIMStoresEgypt",     name: "BIM Stores Egypt" },
-  { slug: "Fathallamarket1948", name: "Fathalla Market 1948" },
-  { slug: "KheirZamanEgypt",    name: "Kheir Zaman Egypt" },
-  { slug: "AlMahmal",           name: "Al Mahmal" },
-  { slug: "ZahranMarket",       name: "Zahran Market" },
-  { slug: "FerganiMarket",      name: "Fergani Market" },
-  { slug: "OscarStores",        name: "Oscar Stores" },
-  { slug: "SpinneysEgypt",      name: "Spinneys Egypt" },
-  { slug: "HyperOne",           name: "Hyper One" },
+  { slug: "AwladRagabCO",              name: "Awlad Ragab" },
+  { slug: "marketelfergany",           name: "El Fergany Market" },
+  { slug: "BIMmisr",                   name: "BIM Egypt" },
+  { slug: "Gomlamarket.Retailcompany", name: "Gomla Market" },
+  { slug: "KheirZamanEgypt",           name: "Kheir Zaman Egypt" },
+  { slug: "SeoudiSupermarket",         name: "Seoudi Market" },
+  { slug: "othaimmarketseg",           name: "Othaim Markets Egypt" },
+  { slug: "fathallacairomarket",       name: "Fathalla Cairo Market" },
+  { slug: "carrefouregypt",            name: "Carrefour Egypt" },
+  { slug: "kazyonegypt",               name: "Kazyon Egypt" },
+  { slug: "MetroMarketEgypt",          name: "Metro Market Egypt" },
+  { slug: "hyperone.eg",               name: "Hyper One" },
 ];
 
 /** Human-like rhythm: pause between page requests (ms). */

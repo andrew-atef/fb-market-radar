@@ -16,18 +16,20 @@
 
 import { Env, AlertsFeedItem, StoreConfig } from "../types";
 
-/** The 10 Egyptian supermarket Facebook pages we monitor. */
+/** The target Egyptian supermarket Facebook pages (12 — user-confirmed list). */
 export const SUPERMARKET_STORES: StoreConfig[] = [
-  { name: "Kazyon Egypt", facebookPage: "kazyonegypt" },
-  { name: "BIM Stores Egypt", facebookPage: "BIMStoresEgypt" },
-  { name: "Fathalla Market 1948", facebookPage: "Fathallamarket1948" },
+  { name: "Awlad Ragab", facebookPage: "AwladRagabCO" },
+  { name: "El Fergany Market", facebookPage: "marketelfergany" },
+  { name: "BIM Egypt", facebookPage: "BIMmisr" },
+  { name: "Gomla Market", facebookPage: "Gomlamarket.Retailcompany" },
   { name: "Kheir Zaman Egypt", facebookPage: "KheirZamanEgypt" },
-  { name: "Al Mahmal", facebookPage: "AlMahmal" },
-  { name: "Zahran Market", facebookPage: "ZahranMarket" },
-  { name: "Fergani Market", facebookPage: "FerganiMarket" },
-  { name: "Oscar Stores", facebookPage: "OscarStores" },
-  { name: "Spinneys Egypt", facebookPage: "SpinneysEgypt" },
-  { name: "Hyper One", facebookPage: "HyperOne" },
+  { name: "Seoudi Market", facebookPage: "SeoudiSupermarket" },
+  { name: "Othaim Markets Egypt", facebookPage: "othaimmarketseg" },
+  { name: "Fathalla Cairo Market", facebookPage: "fathallacairomarket" },
+  { name: "Carrefour Egypt", facebookPage: "carrefouregypt" },
+  { name: "Kazyon Egypt", facebookPage: "kazyonegypt" },
+  { name: "Metro Market Egypt", facebookPage: "MetroMarketEgypt" },
+  { name: "Hyper One", facebookPage: "hyperone.eg" },
 ];
 
 /** Facebook URL host aliases to ignore when matching store slugs. */
