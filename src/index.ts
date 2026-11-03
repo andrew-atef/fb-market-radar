@@ -416,16 +416,54 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
     // --- Dedupe against D1 (numeric post_id or pfbid token) ---
     const existing = await env.DB
-      .prepare("SELECT id FROM posts WHERE post_id = ?")
+      .prepare(
+        "SELECT id, shared_post_id, images_json FROM posts WHERE post_id = ?"
+      )
       .bind(postId)
-      .first<{ id: number }>();
+      .first<{ id: number; shared_post_id: string | null; images_json: string | null }>();
 
     if (existing) {
+      // Backfill: upgrade previously-stored posts that have a shared post
+      // but no canonical Graph attachment images yet.
+      let storedImages: string[] = [];
+      try {
+        storedImages = existing.images_json
+          ? (JSON.parse(existing.images_json) as string[])
+          : [];
+      } catch {
+        storedImages = [];
+      }
+
+      if (existing.shared_post_id && storedImages.length === 0) {
+        try {
+          const graphImages = await fetchPostAttachments(
+            env,
+            existing.shared_post_id
+          );
+          await env.DB
+            .prepare("UPDATE posts SET images_json = ? WHERE id = ?")
+            .bind(JSON.stringify(graphImages.slice(0, 30)), existing.id)
+            .run();
+          return json({
+            success: true,
+            duplicate: true,
+            postId,
+            sharedPostId: existing.shared_post_id,
+            imagesBackfilled: graphImages.length,
+          });
+        } catch (backfillErr) {
+          console.error(
+            `[hook] Image backfill failed for ${postId}:`,
+            backfillErr
+          );
+        }
+      }
+
       return json({
         success: true,
         duplicate: true,
         postId,
-        sharedPostId: null,
+        sharedPostId: existing.shared_post_id,
       });
     }
 
