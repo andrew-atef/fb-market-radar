@@ -26,7 +26,7 @@ import {
   requireAuth,
 } from "./services/dashboard";
 import { dispatchGitHubRadarWorkflow } from "./services/github";
-import { forwardToLaravel } from "./services/laravel";
+import { forwardToLaravel, testLaravelIngest } from "./services/laravel";
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -677,6 +677,79 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         500
       );
     }
+  }
+
+  // GET or POST /api/test-laravel — diagnostic test probe to verify Laravel webhook connectivity
+  if (path === "/api/test-laravel") {
+    const probe = await testLaravelIngest(env);
+    return json(probe);
+  }
+
+  // POST /api/retry-laravel — retries forwarding failed posts to Laravel
+  if (path === "/api/retry-laravel" && request.method === "POST") {
+    const targetPostId = url.searchParams.get("postId");
+    const query = targetPostId
+      ? env.DB.prepare(
+          "SELECT id, post_id, store_name, post_snippet, post_published_at, images_json FROM posts WHERE post_id = ?"
+        ).bind(targetPostId)
+      : env.DB.prepare(
+          "SELECT id, post_id, store_name, post_snippet, post_published_at, images_json FROM posts WHERE forwarded_to_laravel = 0 ORDER BY id DESC LIMIT 10"
+        );
+
+    const rows = await query.all<{
+      id: number;
+      post_id: string;
+      store_name: string;
+      post_snippet: string | null;
+      post_published_at: string | null;
+      images_json: string | null;
+    }>();
+
+    const results = [];
+    for (const row of rows.results ?? []) {
+      const store = SUPERMARKET_STORES.find((s) => s.name === row.store_name);
+      const slug = store?.slug || "unknown";
+      let images: string[] = [];
+      try {
+        images = row.images_json ? JSON.parse(row.images_json) : [];
+      } catch {
+        images = [];
+      }
+
+      const res = await forwardToLaravel(env, {
+        retailerSlug: slug,
+        postId: row.post_id,
+        postText: row.post_snippet || "",
+        imageUrls: images,
+        publishedAt: row.post_published_at,
+      });
+
+      if (res.forwarded) {
+        await env.DB
+          .prepare(
+            "UPDATE posts SET forwarded_to_laravel = 1, laravel_status = ? WHERE id = ?"
+          )
+          .bind(res.statusText, row.id)
+          .run();
+      } else {
+        await env.DB
+          .prepare(
+            "UPDATE posts SET laravel_status = ? WHERE id = ?"
+          )
+          .bind(res.statusText, row.id)
+          .run();
+      }
+
+      results.push({
+        postId: row.post_id,
+        slug,
+        forwarded: res.forwarded,
+        status: res.statusText,
+        body: res.responseBody,
+      });
+    }
+
+    return json({ success: true, retried: results.length, details: results });
   }
 
   // POST or GET /api/dispatch — triggers GitHub Actions radar workflow immediately

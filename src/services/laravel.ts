@@ -79,11 +79,34 @@ export async function forwardToLaravel(
       `[laravel-ingest] Dispatching to Laravel: ${url} (retailer=${payload.retailerSlug}, post_id=${payload.postId}, images=${payload.imageUrls.length})`
     );
 
-    const response = await fetch(url, {
+    // Use redirect: "manual" so we can intercept 301/302 redirects and preserve POST method
+    let targetUrl = url;
+    let response = await fetch(targetUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(requestBody),
+      redirect: "manual",
     });
+
+    // If redirected (e.g. trailing slash or HTTP -> HTTPS), re-post to Location
+    if (
+      response.status === 301 ||
+      response.status === 302 ||
+      response.status === 307 ||
+      response.status === 308 ||
+      (response.status >= 300 && response.status < 400)
+    ) {
+      const location = response.headers.get("Location");
+      if (location) {
+        targetUrl = new URL(location, url).toString();
+        console.log(`[laravel-ingest] Intercepted redirect ${response.status} -> Re-POSTing to: ${targetUrl}`);
+        response = await fetch(targetUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(requestBody),
+        });
+      }
+    }
 
     const responseText = await response.text().catch(() => "");
     let parsedBody: unknown = null;
@@ -93,9 +116,12 @@ export async function forwardToLaravel(
       parsedBody = responseText;
     }
 
+    const allowHeader = response.headers.get("Allow");
     console.log(
-      `[laravel-ingest] Laravel responded HTTP ${response.status} for post ${payload.postId}:`,
-      typeof parsedBody === "object" ? JSON.stringify(parsedBody) : String(parsedBody).slice(0, 200)
+      `[laravel-ingest] Laravel responded HTTP ${response.status} for post ${payload.postId}` +
+      (allowHeader ? ` (Allow: ${allowHeader})` : "") +
+      ` (target: ${targetUrl}):`,
+      typeof parsedBody === "object" ? JSON.stringify(parsedBody) : String(parsedBody).slice(0, 300)
     );
 
     // HTTP 202 Accepted is the primary contract; accept any 2xx
@@ -116,4 +142,47 @@ export async function forwardToLaravel(
       statusText: `Error: ${errorMsg}`,
     };
   }
+}
+
+/**
+ * Diagnostic test probe for the Laravel ingestion webhook.
+ */
+export async function testLaravelIngest(
+  env: Env
+): Promise<{
+  configured: boolean;
+  url: string | null;
+  hasSecret: boolean;
+  status: number;
+  statusText: string;
+  body: unknown;
+}> {
+  const url = env.LARAVEL_INGEST_URL?.trim();
+  if (!url) {
+    return {
+      configured: false,
+      url: null,
+      hasSecret: Boolean(env.LARAVEL_INGEST_SECRET),
+      status: 0,
+      statusText: "LARAVEL_INGEST_URL is not configured",
+      body: null,
+    };
+  }
+
+  const result = await forwardToLaravel(env, {
+    retailerSlug: "gomlamarket",
+    postId: "test_probe_" + Date.now(),
+    postText: "Probe test from Cloudflare Worker",
+    imageUrls: ["https://example.com/test.jpg"],
+    publishedAt: new Date().toISOString(),
+  });
+
+  return {
+    configured: true,
+    url,
+    hasSecret: Boolean(env.LARAVEL_INGEST_SECRET),
+    status: result.statusCode,
+    statusText: result.statusText,
+    body: result.responseBody,
+  };
 }
