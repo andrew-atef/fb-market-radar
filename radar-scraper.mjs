@@ -26,9 +26,11 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-const WARP_PROXY = process.env.WARP_PROXY || "socks5h://127.0.0.1:40000";
-const WORKER_URL = (process.env.WORKER_URL || "").replace(/\/+$/, "");
-const WORKER_KEY = process.env.WORKER_KEY || "";
+const WARP_PROXY = (process.env.WARP_PROXY || "socks5h://127.0.0.1:40000").trim();
+// NB: .trim() guards against secrets set via STDIN/carriage-return artifacts
+// (CRLF) — Node's URL parser rejects URLs containing control characters.
+const WORKER_URL = (process.env.WORKER_URL || "").trim().replace(/\/+$/, "");
+const WORKER_KEY = (process.env.WORKER_KEY || "").trim();
 
 if (!WORKER_URL || !WORKER_KEY) {
   console.error(
