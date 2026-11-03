@@ -21,16 +21,23 @@ export interface FacebookShareResponse {
 /** Media object inside an attachment or subattachment. */
 export interface AttachmentMedia {
   image?: {
-    src: string;
-    height: number;
-    width: number;
+    src?: string;
+    height?: number;
+    width?: number;
   };
+  source?: string;
   [key: string]: unknown;
 }
 
-/** A single subattachment within an attachment. */
+/** A single subattachment within an attachment (individual album photos). */
 export interface Subattachment {
-  media: AttachmentMedia;
+  media?: AttachmentMedia;
+  target?: {
+    id?: string;
+    url?: string;
+  };
+  type?: string;
+  url?: string;
   [key: string]: unknown;
 }
 
@@ -38,16 +45,33 @@ export interface Subattachment {
 export interface Attachment {
   media?: AttachmentMedia;
   subattachments?: {
-    data: Subattachment[];
+    data?: Subattachment[];
   };
+  target?: {
+    id?: string;
+    url?: string;
+  };
+  title?: string;
+  type?: string;
+  url?: string;
   [key: string]: unknown;
 }
 
-/** Shape of the response from GET /{post-id}?fields=attachments{...},child_attachments{...}. */
+/**
+ * Shape of the response from GET /{post-id}?fields=attachments,child_attachments.
+ * Meta returns the post object directly containing `attachments` and `id`.
+ */
 export interface PostAttachmentsResponse {
-  data: Array<{
+  id?: string;
+  attachments?: {
+    data?: Attachment[];
+  };
+  child_attachments?: {
+    data?: Array<{ media?: AttachmentMedia; [key: string]: unknown }>;
+  };
+  /** Fallback in case Meta wraps the response in a connection-style data array. */
+  data?: Array<{
     attachments?: Attachment;
-    /** Present on multi-media link shares. */
     child_attachments?: {
       data?: Array<{ media?: AttachmentMedia }>;
     };
@@ -101,7 +125,7 @@ export async function shareToFacebookPage(
  * Fetches the full attachment graph for a shared post and extracts every
  * image URL from subattachments (and top-level media).
  *
- * GET https://graph.facebook.com/v23.0/{shared_post_id}?fields=attachments{media,subattachments.limit(50){media}},child_attachments{media}&access_token=...
+ * GET https://graph.facebook.com/v23.0/{shared_post_id}?fields=attachments,child_attachments&access_token=...
  *
  * @param env          - Worker environment bindings
  * @param sharedPostId - The shared post ID returned by the feed publish step
@@ -114,10 +138,9 @@ export async function fetchPostAttachments(
 ): Promise<string[]> {
   const url = `${GRAPH_BASE}/${encodeURIComponent(sharedPostId)}`;
   const params = new URLSearchParams();
-  params.set(
-    "fields",
-    "attachments{media,subattachments.limit(50){media}},child_attachments{media}"
-  );
+  // Standard fields query as confirmed working with Graph API v23.0:
+  // automatically expands media, image, and all subattachments in the album.
+  params.set("fields", "attachments,child_attachments");
   params.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
 
   const response = await fetch(`${url}?${params.toString()}`, {
@@ -186,29 +209,55 @@ export async function fetchOriginPostImages(
 function extractImageUrls(data: PostAttachmentsResponse): string[] {
   const images: string[] = [];
 
-  for (const item of data.data ?? []) {
-    const attachment = item.attachments;
-    if (!attachment) continue;
-
-    // Top-level media image
-    if (attachment.media?.image?.src) {
-      images.push(attachment.media.image.src);
+  const addImage = (src?: string | null) => {
+    if (!src || typeof src !== "string") return;
+    const cleanUrl = src.replace(/&amp;/g, "&").trim();
+    if (cleanUrl.startsWith("http") && !images.includes(cleanUrl)) {
+      images.push(cleanUrl);
     }
+  };
 
-    // Subattachments (album / multi-image posts)
+  // 1. Primary path: attachments.data (direct post object from Graph API)
+  const attachments = data.attachments?.data ?? [];
+  for (const attachment of attachments) {
     const subattachments = attachment.subattachments?.data ?? [];
-    for (const sub of subattachments) {
-      if (sub.media?.image?.src) {
-        images.push(sub.media.image.src);
+    if (subattachments.length > 0) {
+      // Album / multi-photo post: subattachments hold each flyer page in exact order
+      for (const sub of subattachments) {
+        addImage(sub.media?.image?.src || sub.media?.source);
       }
+    } else if (attachment.media?.image?.src || attachment.media?.source) {
+      // Single photo post
+      addImage(attachment.media?.image?.src || attachment.media?.source);
     }
   }
 
-  // child_attachments data (multi-media link shares)
-  for (const item of data.data ?? []) {
-    for (const child of item.child_attachments?.data ?? []) {
-      if (child.media?.image?.src) {
-        images.push(child.media.image.src);
+  // 2. Child attachments (multi-media link shares)
+  const childAttachments = data.child_attachments?.data ?? [];
+  for (const child of childAttachments) {
+    addImage(child.media?.image?.src || child.media?.source);
+  }
+
+  // 3. Fallback: if Meta returned wrapped data array
+  if (Array.isArray(data.data)) {
+    for (const item of data.data) {
+      if (item.attachments) {
+        const sub = item.attachments.subattachments?.data ?? [];
+        if (sub.length > 0) {
+          for (const s of sub) {
+            addImage(s.media?.image?.src || s.media?.source);
+          }
+        } else if (
+          item.attachments.media?.image?.src ||
+          item.attachments.media?.source
+        ) {
+          addImage(
+            item.attachments.media?.image?.src || item.attachments.media?.source
+          );
+        }
+      }
+      for (const child of item.child_attachments?.data ?? []) {
+        addImage(child.media?.image?.src || child.media?.source);
       }
     }
   }

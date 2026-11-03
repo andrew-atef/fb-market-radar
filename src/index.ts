@@ -25,6 +25,7 @@ import {
   jsonError,
   requireAuth,
 } from "./services/dashboard";
+import { dispatchGitHubRadarWorkflow } from "./services/github";
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -60,33 +61,28 @@ function hookLatencyMinutes(iso: string | null | undefined): number | null {
   return minutes;
 }
 
-/** Orders-preserving union of image URL lists (first occurrence wins). */
-function mergeUnique(...lists: string[][]): string[] {
-  const out: string[] = [];
-  for (const list of lists) {
-    for (const u of list) {
-      if (u && !out.includes(u)) out.push(u);
-    }
-  }
-  return out;
-}
 
 /**
  * Fetches the shared-post attachments with patient retries:
- * a link share's attachment graph may materialize a few seconds after the
- * feed POST returns, so we retry on empty results too (I/O waits, no CPU burn).
+ * A link share's attachment graph on Meta's CDN may materialize shortly
+ * after the feed POST returns, so we retry on empty results.
  */
 async function fetchSharedImagesWithRetry(
   env: Env,
   sharedPostId: string,
-  attempts = 3
+  attempts = 4
 ): Promise<string[]> {
-  const delaysMs = [0, 3000, 8000];
+  const delaysMs = [500, 2000, 4000, 8000];
   for (let i = 0; i < attempts; i++) {
     if (delaysMs[i]) await new Promise((r) => setTimeout(r, delaysMs[i]));
     try {
       const imgs = await fetchPostAttachments(env, sharedPostId);
-      if (imgs.length > 0) return imgs;
+      if (imgs.length > 0) {
+        console.log(
+          `[hook] Extracted ${imgs.length} attachment images from shared post ${sharedPostId} on attempt ${i + 1}`
+        );
+        return imgs;
+      }
     } catch (err) {
       console.error(
         `[hook] Attachment fetch attempt ${i + 1} failed for ${sharedPostId}:`,
@@ -183,29 +179,28 @@ export async function runSyncPipeline(env: Env): Promise<SyncResult> {
       }
 
       // --- Step 2c: Extract images ---
-      // Real product/offer images live in the ORIGINAL supermarket post's
-      // attachments; our own share is a link post without media.
+      // Primary: Graph API attachments from our own shared post (subattachments/photos).
+      // Fallback: OpenGraph meta tag from the supermarket's original post.
       let images: string[] = [];
-
-      try {
-        images = await fetchOriginPostImages(env, item.postUrl);
-      } catch (originErr) {
-        console.error(
-          `[attachments] Failed to fetch origin attachments for ${item.postId} (${item.storeName}):`,
-          originErr
-        );
-      }
 
       if (sharedPostId) {
         try {
-          const sharedImages = await fetchPostAttachments(env, sharedPostId);
-          for (const img of sharedImages) {
-            if (!images.includes(img)) images.push(img);
-          }
+          images = await fetchSharedImagesWithRetry(env, sharedPostId);
         } catch (attachErr) {
           console.error(
-            `[attachments] Failed to fetch attachments for ${sharedPostId}:`,
+            `[attachments] Failed to fetch attachments for shared post ${sharedPostId}:`,
             attachErr
+          );
+        }
+      }
+
+      if (images.length === 0) {
+        try {
+          images = await fetchOriginPostImages(env, item.postUrl);
+        } catch (originErr) {
+          console.error(
+            `[attachments] Failed to fetch origin attachments for ${item.postId} (${item.storeName}):`,
+            originErr
           );
         }
       }
@@ -513,10 +508,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
     // --- Image pipeline ---
     // Canonical source: the Graph API attachment graph of OUR OWN shared
-    // post (attachments/subattachments/child_attachments). These are the
-    // page-owned 720px renders that produce fbid photo URLs and survive
-    // attribute-independent DC routing. The SSR master URLs extracted by
-    // the scraper act as the fallback when the share carries no media.
+    // post (`fields=attachments,child_attachments`). This extracts the full
+    // album/subattachments directly from Facebook. If present, these are the
+    // exact, official photos of the post/album.
+    // The SSR master URLs extracted by the scraper act only as fallback.
     const ssrImages = Array.isArray(payload.imageUrls)
       ? payload.imageUrls
           .filter(
@@ -526,11 +521,20 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       : [];
 
     let images: string[] = [];
+    let imageSource = "none";
+
     if (sharedPostId) {
       const graphImages = await fetchSharedImagesWithRetry(env, sharedPostId);
-      images = mergeUnique(graphImages, ssrImages).slice(0, 30);
-    } else {
+      if (graphImages.length > 0) {
+        images = graphImages;
+        imageSource = "graph-attachments";
+      } else if (ssrImages.length > 0) {
+        images = ssrImages;
+        imageSource = "ssr-fallback";
+      }
+    } else if (ssrImages.length > 0) {
       images = ssrImages;
+      imageSource = "ssr-fallback";
     }
 
     const publishedSql = isoToSqlDateTime(payload.publishedAt ?? null);
@@ -564,10 +568,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       postId,
       sharedPostId,
       imageCount: images.length,
-      imageSource:
-        images.length > 0 && images[0].includes("fbcdn")
-          ? "graph-attachments-first + ssr-fallback"
-          : "ssr-fallback-only",
+      imageSource,
       latencyMinutes: latency,
     });
   }
@@ -611,6 +612,59 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  // POST or GET /api/dispatch — triggers GitHub Actions radar workflow immediately
+  if (path === "/api/dispatch" && (request.method === "POST" || request.method === "GET")) {
+    const res = await dispatchGitHubRadarWorkflow(env);
+    return json(res, res.success ? 200 : (res.status || 500));
+  }
+
+  // POST /api/backfill-images — updates existing posts that have shared_post_id but empty/missing images
+  if (path === "/api/backfill-images" && request.method === "POST") {
+    try {
+      const rows = await env.DB
+        .prepare(
+          `SELECT id, post_id, shared_post_id, images_json
+           FROM posts
+           WHERE shared_post_id IS NOT NULL
+             AND (images_json IS NULL OR images_json = '[]' OR images_json = '')
+           ORDER BY id DESC
+           LIMIT 20`
+        )
+        .all<{ id: number; post_id: string; shared_post_id: string; images_json: string | null }>();
+
+      const results = [];
+      for (const row of rows.results ?? []) {
+        try {
+          const imgs = await fetchPostAttachments(env, row.shared_post_id);
+          if (imgs.length > 0) {
+            await env.DB
+              .prepare("UPDATE posts SET images_json = ? WHERE id = ?")
+              .bind(JSON.stringify(imgs.slice(0, 50)), row.id)
+              .run();
+            results.push({
+              id: row.id,
+              postId: row.post_id,
+              sharedPostId: row.shared_post_id,
+              imagesCount: imgs.length,
+            });
+          }
+        } catch (err) {
+          results.push({
+            id: row.id,
+            postId: row.post_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      return json({ success: true, updated: results.length, details: results });
+    } catch (err) {
+      return jsonError(
+        err instanceof Error ? err.message : "Backfill failed",
+        500
+      );
+    }
+  }
+
   // POST /api/sync (manual trigger)
   if (path === "/api/sync" && request.method === "POST") {
     try {
@@ -639,20 +693,42 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
 export default {
   /**
-   * Cron Trigger: fires every 5 minutes (cron: star-slash-5 star star star star).
+   * Cron Trigger: fires with sub-second precision every 10 minutes.
+   *
+   * Responsibilities:
+   *  1. "Wakes up" GitHub Actions by dispatching the `radar.yml` workflow,
+   *     which spins up Ubuntu + WARP SOCKS5 proxy to scrape the 12 supermarket
+   *     Facebook pages and push new posts back to /api/hook.
+   *  2. Runs supplementary Google Alerts sync as fallback.
    */
   async scheduled(
     _event: ScheduledEvent,
     env: Env,
     _ctx: ExecutionContext
   ): Promise<void> {
-    console.log("[cron] Sync triggered at", new Date().toISOString());
-    const result = await runSyncPipeline(env);
-    console.log(
-      `[cron] Sync complete: ${result.new_posts_found} new post(s), status=${result.status}`
-    );
-    if (result.error_message) {
-      console.error("[cron] Sync error:", result.error_message);
+    console.log("[cron] Scheduled trigger fired at", new Date().toISOString());
+
+    // 1. Awaken GitHub Actions radar workflow
+    if (env.GITHUB_TOKEN) {
+      const dispatchRes = await dispatchGitHubRadarWorkflow(env);
+      console.log(`[cron] GitHub radar dispatch: ${dispatchRes.message}`);
+    } else {
+      console.log(
+        "[cron] Note: GITHUB_TOKEN not configured. Set via `wrangler secret put GITHUB_TOKEN` to awaken GitHub Actions automatically."
+      );
+    }
+
+    // 2. Supplementary Alerts sync
+    try {
+      const result = await runSyncPipeline(env);
+      console.log(
+        `[cron] Supplementary Alerts sync complete: ${result.new_posts_found} new post(s), status=${result.status}`
+      );
+      if (result.error_message) {
+        console.error("[cron] Alerts sync error:", result.error_message);
+      }
+    } catch (err) {
+      console.error("[cron] Alerts sync exception:", err);
     }
   },
 

@@ -400,21 +400,24 @@ const DASHBOARD_HTML_CSS =
   '      </div>\n' +
   '    </div>\n' +
   '\n' +
-  '    <!-- Manual Sync -->\n' +
+  '    <!-- Manual Controls -->\n' +
   '    <div class="section">\n' +
   '      <div class="section-head">\n' +
-  '        <div class="section-title">🔄 Manual Sync</div>\n' +
+  '        <div class="section-title">⚡ Radar &amp; Sync Controls</div>\n' +
   '        <div class="section-actions">\n' +
-  '          <button id="btnSync" class="btn-primary">\n' +
-  '            <span id="syncBtnLabel">Sync Now</span>\n' +
+  '          <button id="btnRadar" class="btn-primary" style="background:#7c3aed;border-color:#8b5cf6;">\n' +
+  '            <span id="radarBtnLabel">⚡ Wake Up Radar</span>\n' +
+  '          </button>\n' +
+  '          <button id="btnSync" class="btn-secondary">\n' +
+  '            <span id="syncBtnLabel">🔄 Alerts Sync</span>\n' +
   '          </button>\n' +
   '          <button id="btnRefresh" class="btn-secondary">Refresh</button>\n' +
   '        </div>\n' +
   '      </div>\n' +
   '      <div class="section-body" style="padding:16px 24px;">\n' +
   '        <p style="font-size:0.85rem;color:var(--muted);">\n' +
-  '          Trigger an immediate sync run to check all 10 Egyptian supermarket\n' +
-  '          Facebook pages for new posts via the free Google Alerts feed.\n' +
+  '          <strong>Radar:</strong> Dispatches GitHub Actions runner to scan the 12 supermarket pages via WARP proxy &amp; pull flyer attachments via Graph API.<br/>\n' +
+  '          <strong>Alerts Sync:</strong> Supplementary poll of Google Alerts feed.\n' +
   '        </p>\n' +
   '      </div>\n' +
   '    </div>\n' +
@@ -643,6 +646,29 @@ const DASHBOARD_HTML_CSS =
   '      }\n' +
   '    }\n' +
   '\n' +
+  '    async function doRadar() {\n' +
+  '      const btn = document.getElementById("btnRadar");\n' +
+  '      const label = document.getElementById("radarBtnLabel");\n' +
+  '      if (!btn || !label) return;\n' +
+  '      btn.disabled = true;\n' +
+  '      label.textContent = "Waking Up…";\n' +
+  '      try {\n' +
+  '        const result = await apiPost("dispatch");\n' +
+  '        if (result.success) {\n' +
+  '          showToast("GitHub Actions Radar awakened successfully! 🚀", true);\n' +
+  '        } else {\n' +
+  '          showToast("Radar dispatch: " + (result.message || "Failed"), false);\n' +
+  '        }\n' +
+  '      } catch (e) {\n' +
+  '        showToast("Dispatch request failed", false);\n' +
+  '      } finally {\n' +
+  '        btn.disabled = false;\n' +
+  '        label.textContent = "⚡ Wake Up Radar";\n' +
+  '      }\n' +
+  '    }\n' +
+  '\n' +
+  '    const btnRadarEl = document.getElementById("btnRadar");\n' +
+  '    if (btnRadarEl) btnRadarEl.addEventListener("click", doRadar);\n' +
   '    document.getElementById("btnSync").addEventListener("click", doSync);\n' +
   '    document.getElementById("btnRefresh").addEventListener("click", function() {\n' +
   '      Promise.all([loadStats(), loadPosts(), loadLogs()]);\n' +

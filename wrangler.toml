@@ -19,9 +19,9 @@ database_name = "facebook-monitor-db"
 # and applying the migration. Copy the output ID here.
 database_id = "52a28e2d-77e9-4537-a88a-9c430159d3b3"
 
-# Cron Trigger: every 5 minutes
+# Cron Trigger: every 10 minutes (sub-second precision trigger for GitHub Actions radar)
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/10 * * * *"]
 
 [vars]
 # No runtime config vars needed; all secrets are set via `wrangler secret put`

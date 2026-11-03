@@ -11,6 +11,12 @@ export interface Env {
   FB_PAGE_ID: string;
   FB_PAGE_ACCESS_TOKEN: string;
   DASHBOARD_AUTH_KEY: string;
+  /** GitHub Personal Access Token with repo or actions:write permissions. */
+  GITHUB_TOKEN?: string;
+  /** GitHub repository in "owner/repo" format. Defaults to "andrew-atef/fb-market-radar". */
+  GITHUB_REPO?: string;
+  /** Target branch to dispatch. Defaults to "main". */
+  GITHUB_BRANCH?: string;
 }
 
 /** Configured Egyptian supermarket stores to monitor on Facebook. */
