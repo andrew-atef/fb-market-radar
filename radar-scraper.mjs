@@ -160,6 +160,9 @@ async function fetchViaWarp(handle) {
     "-H", "Sec-Fetch-Dest: document",
     "-H", "Sec-Fetch-Mode: navigate",
     "-H", "Sec-Fetch-Site: none",
+    // Transient WARP handshakes occasionally drop one request per run; retry.
+    "--retry", "2",
+    "--retry-delay", "1",
     "--max-time", "20",
     `https://www.facebook.com/${handle}`,
   ];
