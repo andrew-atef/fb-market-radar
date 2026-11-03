@@ -279,10 +279,11 @@ async function main() {
           latency: body.latencyMinutes,
         });
         console.log(
-          `[radar] ${store.slug.padEnd(20)} SHARED ${post.postId} → ${body.sharedPostId}` +
+          `[radar] ${store.slug.padEnd(24)} SHARED ${post.postId} → ${body.sharedPostId}` +
             (body.latencyMinutes !== null && body.latencyMinutes !== undefined
               ? ` (true latency: ${body.latencyMinutes}m)`
-              : "")
+              : "") +
+            ` | imgs:${body.imageCount ?? "?"} (${body.imageSource ?? "-"})`
         );
       } else {
         summary.push({ store: store.slug, status: "HOOK_ERROR", http: status, body });

@@ -71,6 +71,33 @@ function mergeUnique(...lists: string[][]): string[] {
   return out;
 }
 
+/**
+ * Fetches the shared-post attachments with patient retries:
+ * a link share's attachment graph may materialize a few seconds after the
+ * feed POST returns, so we retry on empty results too (I/O waits, no CPU burn).
+ */
+async function fetchSharedImagesWithRetry(
+  env: Env,
+  sharedPostId: string,
+  attempts = 3
+): Promise<string[]> {
+  const delaysMs = [0, 3000, 8000];
+  for (let i = 0; i < attempts; i++) {
+    if (delaysMs[i]) await new Promise((r) => setTimeout(r, delaysMs[i]));
+    try {
+      const imgs = await fetchPostAttachments(env, sharedPostId);
+      if (imgs.length > 0) return imgs;
+    } catch (err) {
+      console.error(
+        `[hook] Attachment fetch attempt ${i + 1} failed for ${sharedPostId}:`,
+        err
+      );
+    }
+  }
+  return [];
+}
+
+
 /* ------------------------------------------------------------------ */
 /* Core Pipeline                                                      */
 /* ------------------------------------------------------------------ */
@@ -500,16 +527,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
     let images: string[] = [];
     if (sharedPostId) {
-      try {
-        const graphImages = await fetchPostAttachments(env, sharedPostId);
-        images = mergeUnique(graphImages, ssrImages).slice(0, 30);
-      } catch (attachErr) {
-        console.error(
-          `[hook] Failed to fetch shared-post attachments for ${sharedPostId}:`,
-          attachErr
-        );
-        images = ssrImages;
-      }
+      const graphImages = await fetchSharedImagesWithRetry(env, sharedPostId);
+      images = mergeUnique(graphImages, ssrImages).slice(0, 30);
     } else {
       images = ssrImages;
     }
@@ -545,9 +564,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       postId,
       sharedPostId,
       imageCount: images.length,
-      imageSource: sharedPostId
-        ? "graph-attachments+ssr-fallback"
-        : "ssr-fallback",
+      imageSource:
+        images.length > 0 && images[0].includes("fbcdn")
+          ? "graph-attachments-first + ssr-fallback"
+          : "ssr-fallback-only",
       latencyMinutes: latency,
     });
   }
