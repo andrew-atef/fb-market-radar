@@ -17,12 +17,15 @@ CREATE TABLE IF NOT EXISTS posts (
   post_published_at DATETIME,
   post_age_index_minutes INTEGER,
   latency_minutes INTEGER,
+  forwarded_to_laravel INTEGER DEFAULT 0,
+  laravel_status TEXT DEFAULT 'Local Only',
   discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_posts_post_id ON posts(post_id);
 CREATE INDEX IF NOT EXISTS idx_posts_store_name ON posts(store_name);
 CREATE INDEX IF NOT EXISTS idx_posts_discovered_at ON posts(discovered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_forwarded ON posts(forwarded_to_laravel);
 
 -- Table: sync_logs
 -- Audit trail of every cron / manual sync run.

@@ -17,12 +17,22 @@ export interface Env {
   GITHUB_REPO?: string;
   /** Target branch to dispatch. Defaults to "main". */
   GITHUB_BRANCH?: string;
+  /** Target Laravel endpoint URL for post ingestion (e.g. https://your-domain.com/api/v1/facebook/ingest). */
+  LARAVEL_INGEST_URL?: string;
+  /** Shared secret matching Laravel's INGEST_WEBHOOK_SECRET / X-Ingest-Secret header. */
+  LARAVEL_INGEST_SECRET?: string;
 }
 
 /** Configured Egyptian supermarket stores to monitor on Facebook. */
 export interface StoreConfig {
+  /** Database slug expected by Laravel backend (e.g. "kazyon"). */
+  slug: string;
+  /** Real Facebook page handle (e.g. "kazyonegypt"). */
+  handle: string;
+  /** Store display name in Arabic. */
   name: string;
-  facebookPage: string;
+  /** Backwards-compatible alias for handle. */
+  facebookPage?: string;
 }
 
 /** A fully-mapped item from the Google Alerts Atom feed (pipeline-ready). */
@@ -89,6 +99,8 @@ export interface PostRow {
   post_published_at: string | null;
   post_age_index_minutes: number | null;
   latency_minutes: number | null;
+  forwarded_to_laravel?: number | boolean | null;
+  laravel_status?: string | null;
   discovered_at: string;
 }
 
@@ -104,8 +116,12 @@ export interface SyncLogRow {
 
 /** Ingest payload sent by the GitHub Actions radar scraper (POST /api/hook). */
 export interface RadarHookPayload {
-  /** Facebook page slug the post was scraped from (e.g. "kazyonegypt"). */
+  /** Database slug expected by Laravel backend (e.g. "kazyon") or Facebook handle. */
   retailerSlug: string;
+  /** Real Facebook page handle (e.g. "kazyonegypt"). */
+  retailerHandle?: string;
+  /** Arabic store display name. */
+  retailerName?: string;
   /** Numeric Facebook post ID ("1582809850544586") or pfbid token. */
   postId: string;
   /** Full post caption text decoded from the SSR Relay JSON (optional). */

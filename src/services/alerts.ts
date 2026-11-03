@@ -18,18 +18,18 @@ import { Env, AlertsFeedItem, StoreConfig } from "../types";
 
 /** The target Egyptian supermarket Facebook pages (12 — user-confirmed list). */
 export const SUPERMARKET_STORES: StoreConfig[] = [
-  { name: "Awlad Ragab", facebookPage: "AwladRagabCO" },
-  { name: "El Fergany Market", facebookPage: "marketelfergany" },
-  { name: "BIM Egypt", facebookPage: "BIMmisr" },
-  { name: "Gomla Market", facebookPage: "Gomlamarket.Retailcompany" },
-  { name: "Kheir Zaman Egypt", facebookPage: "KheirZamanEgypt" },
-  { name: "Seoudi Market", facebookPage: "SeoudiSupermarket" },
-  { name: "Othaim Markets Egypt", facebookPage: "othaimmarketseg" },
-  { name: "Fathalla Cairo Market", facebookPage: "fathallacairomarket" },
-  { name: "Carrefour Egypt", facebookPage: "carrefouregypt" },
-  { name: "Kazyon Egypt", facebookPage: "kazyonegypt" },
-  { name: "Metro Market Egypt", facebookPage: "MetroMarketEgypt" },
-  { name: "Hyper One", facebookPage: "hyperone.eg" },
+  { handle: "kazyonegypt", slug: "kazyon", name: "كازيون", facebookPage: "kazyonegypt" },
+  { handle: "BIMmisr", slug: "bimmisr", name: "بيم", facebookPage: "BIMmisr" },
+  { handle: "carrefouregypt", slug: "carrefouregypt", name: "كارفور", facebookPage: "carrefouregypt" },
+  { handle: "hyperone.eg", slug: "hyperone", name: "هايبر وان", facebookPage: "hyperone.eg" },
+  { handle: "fathallacairomarket", slug: "fathalla", name: "فتح الله", facebookPage: "fathallacairomarket" },
+  { handle: "marketelfergany", slug: "elfergany", name: "الفرجاني", facebookPage: "marketelfergany" },
+  { handle: "AwladRagabCO", slug: "awladragab", name: "أولاد رجب", facebookPage: "AwladRagabCO" },
+  { handle: "Gomlamarket.Retailcompany", slug: "gomlamarket", name: "جملة ماركت", facebookPage: "Gomlamarket.Retailcompany" },
+  { handle: "KheirZamanEgypt", slug: "kheirzaman", name: "خير زمان", facebookPage: "KheirZamanEgypt" },
+  { handle: "SeoudiSupermarket", slug: "seoudi", name: "سعودي", facebookPage: "SeoudiSupermarket" },
+  { handle: "othaimmarketseg", slug: "othaim", name: "أسواق العثيم", facebookPage: "othaimmarketseg" },
+  { handle: "MetroMarketEgypt", slug: "metromarket", name: "مترو", facebookPage: "MetroMarketEgypt" },
 ];
 
 /** Facebook URL host aliases to ignore when matching store slugs. */
@@ -167,7 +167,10 @@ export function extractStoreNameFromUrl(url: string): string | null {
   if (HOST_ALIASES.has(slug.toLowerCase())) return null;
 
   const store = SUPERMARKET_STORES.find(
-    (s) => s.facebookPage.toLowerCase() === slug.toLowerCase()
+    (s) =>
+      s.handle.toLowerCase() === slug.toLowerCase() ||
+      s.slug.toLowerCase() === slug.toLowerCase() ||
+      (s.facebookPage && s.facebookPage.toLowerCase() === slug.toLowerCase())
   );
   return store ? store.name : null;
 }

@@ -26,6 +26,7 @@ import {
   requireAuth,
 } from "./services/dashboard";
 import { dispatchGitHubRadarWorkflow } from "./services/github";
+import { forwardToLaravel } from "./services/laravel";
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -216,13 +217,41 @@ export async function runSyncPipeline(env: Env): Promise<SyncResult> {
           ? toSqlDateTime(new Date(pollTime.getTime() - ageMinutes * 60_000))
           : null;
 
+      const matchedStore = SUPERMARKET_STORES.find(
+        (s) =>
+          s.slug.toLowerCase() === item.storeSlug.toLowerCase() ||
+          s.handle.toLowerCase() === item.storeSlug.toLowerCase() ||
+          (s.facebookPage && s.facebookPage.toLowerCase() === item.storeSlug.toLowerCase())
+      );
+      const laravelSlug = matchedStore?.slug || item.storeSlug;
+
+      let forwardedToLaravel = 0;
+      let laravelStatus = "Local Only";
+      if (env.LARAVEL_INGEST_URL) {
+        try {
+          const laravelRes = await forwardToLaravel(env, {
+            retailerSlug: laravelSlug,
+            postId: item.postId,
+            postText: item.snippet || item.title || "",
+            imageUrls: images,
+            publishedAt: postPublishedAt,
+          });
+          forwardedToLaravel = laravelRes.forwarded ? 1 : 0;
+          laravelStatus = laravelRes.statusText;
+        } catch (lErr) {
+          console.error(`[sync-pipeline] Laravel forward error:`, lErr);
+          laravelStatus = "Error";
+        }
+      }
+
       await env.DB
         .prepare(
           `INSERT INTO posts (
             post_id, store_name, post_url, post_title, post_snippet,
             shared_post_id, images_json,
-            post_published_at, post_age_index_minutes, latency_minutes
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            post_published_at, post_age_index_minutes, latency_minutes,
+            forwarded_to_laravel, laravel_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .bind(
           item.postId,
@@ -234,7 +263,9 @@ export async function runSyncPipeline(env: Env): Promise<SyncResult> {
           JSON.stringify(images),
           postPublishedAt,
           ageMinutes,
-          ageMinutes !== null && !isBackfill ? ageMinutes : null
+          ageMinutes !== null && !isBackfill ? ageMinutes : null,
+          forwardedToLaravel,
+          laravelStatus
         )
         .run();
 
@@ -350,6 +381,7 @@ async function getRecentPosts(env: Env): Promise<Array<Record<string, unknown>>>
       `SELECT id, post_id, store_name, post_url, post_title, post_snippet,
               shared_post_id, images_json,
               post_published_at, post_age_index_minutes, latency_minutes,
+              forwarded_to_laravel, laravel_status,
               discovered_at
        FROM posts
        ORDER BY discovered_at DESC
@@ -430,19 +462,29 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     }
 
     const store = SUPERMARKET_STORES.find(
-      (s) => s.facebookPage.toLowerCase() === slug.toLowerCase()
+      (s) =>
+        s.slug.toLowerCase() === slug.toLowerCase() ||
+        s.handle.toLowerCase() === slug.toLowerCase() ||
+        (s.facebookPage && s.facebookPage.toLowerCase() === slug.toLowerCase())
     );
     if (!store) {
       return jsonError(`Unknown store slug: ${slug}`, 400);
     }
 
     // --- Dedupe against D1 (numeric post_id or pfbid token) ---
+    // If already exists, return status: 'DUPLICATE' to prevent calling Laravel and wasting Gemini AI quota
     const existing = await env.DB
       .prepare(
-        "SELECT id, shared_post_id, images_json FROM posts WHERE post_id = ?"
+        "SELECT id, shared_post_id, images_json, forwarded_to_laravel, laravel_status FROM posts WHERE post_id = ?"
       )
       .bind(postId)
-      .first<{ id: number; shared_post_id: string | null; images_json: string | null }>();
+      .first<{
+        id: number;
+        shared_post_id: string | null;
+        images_json: string | null;
+        forwarded_to_laravel: number | null;
+        laravel_status: string | null;
+      }>();
 
     if (existing) {
       // Backfill: upgrade previously-stored posts that have a shared post
@@ -467,11 +509,14 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             .bind(JSON.stringify(graphImages.slice(0, 30)), existing.id)
             .run();
           return json({
+            status: "DUPLICATE",
             success: true,
             duplicate: true,
             postId,
             sharedPostId: existing.shared_post_id,
             imagesBackfilled: graphImages.length,
+            forwardedToLaravel: Boolean(existing.forwarded_to_laravel),
+            laravelStatus: existing.laravel_status || "Local Only",
           });
         } catch (backfillErr) {
           console.error(
@@ -482,15 +527,19 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
 
       return json({
+        status: "DUPLICATE",
         success: true,
         duplicate: true,
         postId,
         sharedPostId: existing.shared_post_id,
+        forwardedToLaravel: Boolean(existing.forwarded_to_laravel),
+        laravelStatus: existing.laravel_status || "Local Only",
       });
     }
 
     // --- Share to the user's Facebook Page ---
-    const postUrl = `https://www.facebook.com/${store.facebookPage}/posts/${postId}`;
+    const handle = store.handle || store.facebookPage;
+    const postUrl = `https://www.facebook.com/${handle}/posts/${postId}`;
     const postText =
       typeof payload.postText === "string" ? payload.postText.trim() : "";
     const message = `عروض جديدة من ${store.name} 🛒🔥\n\n${postText}`;
@@ -517,7 +566,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           .filter(
             (u): u is string => typeof u === "string" && u.startsWith("http")
           )
-          .slice(0, 20)
+          .slice(0, 80)
       : [];
 
     let images: string[] = [];
@@ -540,13 +589,26 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const publishedSql = isoToSqlDateTime(payload.publishedAt ?? null);
     const latency = hookLatencyMinutes(payload.publishedAt ?? null);
 
+    // --- Forward to Laravel backend ingestion API ---
+    const laravelRes = await forwardToLaravel(env, {
+      retailerSlug: store.slug, // exact database slug (e.g. "kazyon", "bimmisr")
+      postId,
+      postText: postText || "",
+      imageUrls: images.length > 0 ? images : (ssrImages.length > 0 ? ssrImages : []),
+      publishedAt: payload.publishedAt || null,
+    });
+
+    const forwardedToLaravel = laravelRes.forwarded ? 1 : 0;
+    const laravelStatus = laravelRes.statusText;
+
     await env.DB
       .prepare(
         `INSERT INTO posts (
           post_id, store_name, post_url, post_title, post_snippet,
           shared_post_id, images_json,
-          post_published_at, post_age_index_minutes, latency_minutes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          post_published_at, post_age_index_minutes, latency_minutes,
+          forwarded_to_laravel, laravel_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         postId,
@@ -558,11 +620,14 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         JSON.stringify(images),
         publishedSql,
         null,
-        latency
+        latency,
+        forwardedToLaravel,
+        laravelStatus
       )
       .run();
 
     return json({
+      status: "SUCCESS",
       success: true,
       duplicate: false,
       postId,
@@ -570,6 +635,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       imageCount: images.length,
       imageSource,
       latencyMinutes: latency,
+      forwardedToLaravel: Boolean(forwardedToLaravel),
+      laravelStatus,
     });
   }
 

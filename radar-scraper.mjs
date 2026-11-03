@@ -39,20 +39,25 @@ if (!WORKER_URL || !WORKER_KEY) {
   process.exit(1);
 }
 
-/** The target Egyptian supermarket Facebook pages (12 — user-confirmed list). */
+/**
+ * The target Egyptian supermarket Facebook pages with exact Laravel slugs.
+ *   - handle: Real Facebook page handle for WARP SSR crawling
+ *   - slug:   Target database slug expected by Laravel backend
+ *   - name:   Arabic store name
+ */
 const STORES = [
-  { slug: "AwladRagabCO",              name: "Awlad Ragab" },
-  { slug: "marketelfergany",           name: "El Fergany Market" },
-  { slug: "BIMmisr",                   name: "BIM Egypt" },
-  { slug: "Gomlamarket.Retailcompany", name: "Gomla Market" },
-  { slug: "KheirZamanEgypt",           name: "Kheir Zaman Egypt" },
-  { slug: "SeoudiSupermarket",         name: "Seoudi Market" },
-  { slug: "othaimmarketseg",           name: "Othaim Markets Egypt" },
-  { slug: "fathallacairomarket",       name: "Fathalla Cairo Market" },
-  { slug: "carrefouregypt",            name: "Carrefour Egypt" },
-  { slug: "kazyonegypt",               name: "Kazyon Egypt" },
-  { slug: "MetroMarketEgypt",          name: "Metro Market Egypt" },
-  { slug: "hyperone.eg",               name: "Hyper One" },
+  { handle: 'kazyonegypt', slug: 'kazyon', name: 'كازيون' },
+  { handle: 'BIMmisr', slug: 'bimmisr', name: 'بيم' },
+  { handle: 'carrefouregypt', slug: 'carrefouregypt', name: 'كارفور' },
+  { handle: 'hyperone.eg', slug: 'hyperone', name: 'هايبر وان' },
+  { handle: 'fathallacairomarket', slug: 'fathalla', name: 'فتح الله' },
+  { handle: 'marketelfergany', slug: 'elfergany', name: 'الفرجاني' },
+  { handle: 'AwladRagabCO', slug: 'awladragab', name: 'أولاد رجب' },
+  { handle: 'Gomlamarket.Retailcompany', slug: 'gomlamarket', name: 'جملة ماركت' },
+  { handle: 'KheirZamanEgypt', slug: 'kheirzaman', name: 'خير زمان' },
+  { handle: 'SeoudiSupermarket', slug: 'seoudi', name: 'سعودي' },
+  { handle: 'othaimmarketseg', slug: 'othaim', name: 'أسواق العثيم' },
+  { handle: 'MetroMarketEgypt', slug: 'metromarket', name: 'مترو' }
 ];
 
 /** Human-like rhythm: pause between page requests (ms). */
@@ -137,7 +142,7 @@ export function extractNewestPost(html) {
     }
   }
 
-  return { postId, publishedAt, text, images: images.slice(0, 12) };
+  return { postId, publishedAt, text, images: images.slice(0, 80) };
 }
 
 /* ------------------------------------------------------------------ */
@@ -187,6 +192,8 @@ async function dispatchToWorker(store, post) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       retailerSlug: store.slug,
+      retailerHandle: store.handle,
+      retailerName: store.name,
       postId: post.postId,
       postText: post.text,
       imageUrls: post.images,
@@ -236,13 +243,13 @@ async function main() {
     if (i > 0) await sleep(INTER_STORE_DELAY_MS);
 
     try {
-      const html = await fetchViaWarp(store.slug);
+      const html = await fetchViaWarp(store.handle);
       const post = extractNewestPost(html);
 
       if (!post) {
         summary.push({ store: store.slug, status: "NO_ID", htmlBytes: html.length });
         console.log(
-          `[radar] ${store.slug.padEnd(20)} NO_ID (${html.length}B — error/login shell, like locally)`
+          `[radar] ${(store.slug + " (" + store.handle + ")").padEnd(30)} NO_ID (${html.length}B — error/login shell, like locally)`
         );
         continue;
       }

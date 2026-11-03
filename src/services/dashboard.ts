@@ -437,6 +437,7 @@ const DASHBOARD_HTML_CSS =
   '              <th style="width:150px;">Discovered</th>\n' +
   '              <th style="width:150px;">Published Est.</th>\n' +
   '              <th style="width:90px;">Delay</th>\n' +
+  '              <th style="width:130px;">Laravel</th>\n' +
   '              <th>Links</th>\n' +
   '              <th style="width:140px;">Images</th>\n' +
   '            </tr>\n' +
@@ -546,7 +547,7 @@ const DASHBOARD_HTML_CSS =
   '        const posts = await apiGet("posts");\n' +
   '        const body = document.getElementById("postsBody");\n' +
   '        if (!posts || posts.length === 0) {\n' +
-  '          body.innerHTML = \'<tr><td colspan="8" class="empty">No posts tracked yet. Run a sync to discover posts.</td></tr>\';\n' +
+  '          body.innerHTML = \'<tr><td colspan="9" class="empty">No posts tracked yet. Run a sync to discover posts.</td></tr>\';\n' +
   '          return;\n' +
   '        }\n' +
   '        body.innerHTML = posts.map(function(p) {\n' +
@@ -563,6 +564,14 @@ const DASHBOARD_HTML_CSS =
   '            sharedLink = \'<span class="link-btn" style="color:var(--muted);border-color:transparent;cursor:default;">Not shared</span>\';\n' +
   '          }\n' +
   '          const originalLink = \'<a class="link-btn" href="\' + escapeHtml(p.post_url) + \'" target="_blank" rel="noopener">Original ↗</a>\';\n' +
+  '          var laravelBadge;\n' +
+  '          if (p.forwarded_to_laravel === 1 || p.forwarded_to_laravel === true || (p.laravel_status && p.laravel_status.indexOf("Forwarded") !== -1)) {\n' +
+  '            laravelBadge = \'<span class="status-pill ok" style="font-size:0.7rem;padding:3px 8px;">Forwarded (202)</span>\';\n' +
+  '          } else if (p.laravel_status && p.laravel_status.indexOf("Failed") !== -1) {\n' +
+  '            laravelBadge = \'<span class="status-pill err" style="font-size:0.7rem;padding:3px 8px;">\' + escapeHtml(p.laravel_status) + \'</span>\';\n' +
+  '          } else {\n' +
+  '            laravelBadge = \'<span class="status-pill" style="font-size:0.7rem;padding:3px 8px;color:var(--muted);">Local Only</span>\';\n' +
+  '          }\n' +
   '          return \'<tr>\' +\n' +
   '            \'<td><div class="store-badge">\' + escapeHtml(p.store_name) + \'</div></td>\' +\n' +
   '            \'<td class="title-cell" title="\' + escapeHtml(p.post_title || "") + \'">\' + escapeHtml(p.post_title || "(no title)") + \'</td>\' +\n' +
@@ -570,6 +579,7 @@ const DASHBOARD_HTML_CSS =
   '            \'<td class="date-cell">\' + fmtDate(p.discovered_at) + \'</td>\' +\n' +
   '            \'<td class="date-cell">\' + (p.post_published_at ? fmtDate(p.post_published_at) : "N/A") + \'</td>\' +\n' +
   '            \'<td class="date-cell">\' + (p.latency_minutes != null ? p.latency_minutes + " min" : "N/A") + \'</td>\' +\n' +
+  '            \'<td>\' + laravelBadge + \'</td>\' +\n' +
   '            \'<td><div class="links-col">\' + originalLink + sharedLink + \'</div></td>\' +\n' +
   '            \'<td><div class="image-chip">\' + imageCount + \' image\' + (imageCount !== 1 ? "s" : "") + \'</div>\' +\n' +
   '            \'<div class="thumb-list">\' + thumbs + (more ? \'<span class="no-images">\' + more + \'</span>\' : "") + \'</div>\' +\n' +
@@ -579,7 +589,7 @@ const DASHBOARD_HTML_CSS =
   '      } catch (e) {\n' +
   '        console.error("loadPosts", e);\n' +
   '        document.getElementById("postsBody").innerHTML =\n' +
-  '          \'<tr><td colspan="8" class="empty">Error loading posts.</td></tr>\';\n' +
+  '          \'<tr><td colspan="9" class="empty">Error loading posts.</td></tr>\';\n' +
   '      }\n' +
   '    }\n' +
   '\n' +

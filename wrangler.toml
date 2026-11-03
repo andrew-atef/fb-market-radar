@@ -25,6 +25,13 @@ crons = ["*/10 * * * *"]
 
 [vars]
 # No runtime config vars needed; all secrets are set via `wrangler secret put`
+# Required Worker secrets:
+#   - FB_PAGE_ID: Your Facebook Page ID
+#   - FB_PAGE_ACCESS_TOKEN: Permanent Meta Graph Page Access Token
+#   - DASHBOARD_AUTH_KEY: Admin API key
+#   - GITHUB_TOKEN: GitHub PAT with repo/workflow scope to trigger GitHub Actions
+#   - LARAVEL_INGEST_URL: Target Laravel ingestion endpoint (e.g. https://your-domain.com/api/v1/facebook/ingest)
+#   - LARAVEL_INGEST_SECRET: Shared secret matching Laravel's INGEST_WEBHOOK_SECRET (sent via X-Ingest-Secret)
 
 [observability]
 enabled = true
