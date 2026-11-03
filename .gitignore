@@ -1,0 +1,32 @@
+# Dependencies / build artifacts
+node_modules/
+dist/
+.wrangler/
+dev.wrangler/
+
+# Secrets & environment
+.env
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# --- Scratch / investigation artifacts (session 2026-11-03) ---
+# SSR evidence samples & variant tests (:size 0.3–1.5MB each — never commit)
+*.html
+!docs/*.html
+# Local probe & debug drivers
+probe-radar.mjs
+debug-graph.mjs
+# Experiment & analysis scripts
+test-*.ps1
+analyze-*.ps1
+# Feed capture & local measurement artifacts
+feed-latest.xml
+alerts-freshness.log
+sampler.ps1
+# Hook test payloads
+hook-test.json
+hook-test2.json
+warp_result_row_*.txt

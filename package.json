@@ -1,0 +1,20 @@
+{
+  "name": "facebook-supermarket-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that monitors Egyptian supermarket Facebook pages, shares new posts to a Page, and serves an admin dashboard.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "d1:create": "wrangler d1 create facebook-monitor-db",
+    "d1:migrate": "wrangler d1 execute facebook-monitor-db --file=schema.sql",
+    "d1:exec": "wrangler d1 execute facebook-monitor-db --local --file=schema.sql"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.72.0"
+  }
+}

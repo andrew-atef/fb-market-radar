@@ -1,0 +1,73 @@
+# Facebook Radar — 24/7 cloud post discovery at zero cost.
+#
+# Runs every 10 minutes on a PUBLIC repository (unlimited free minutes):
+#   1. Installs Cloudflare WARP and switches it to SOCKS5 proxy mode
+#      (empirically verified 2026-11-03: Facebook serves the full ~1.5MB
+#      guest-SSR HTML — post_id, creation_time, captions, master images —
+#      to WARP egress IPs, instead of the 342KB datacenter block shell).
+#   2. Runs radar-scraper.mjs over the 10 Egyptian supermarket pages
+#      and POSTs new posts to the Cloudflare Worker /api/hook endpoint,
+#      which dedupes against D1 and shares them to the user's Facebook Page.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   WORKER_URL — Cloudflare Worker URL (no trailing slash)
+#   WORKER_KEY — the Worker's DASHBOARD_AUTH_KEY secret value
+#
+# Note: GitHub-hosted runners are datacenter VMs, so the workflow installs
+# WARP itself — runner IPs alone are blocked by Facebook like Cloudflare's.
+
+name: facebook-radar
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: facebook-radar
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-warp.list
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+
+      - name: Start WARP in SOCKS5 proxy mode (port 40000)
+        run: |
+          sudo systemctl start warp-svc
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos proxy port 40000
+          warp-cli --accept-tos connect
+          sleep 3
+          # Verify WARP egress connection — hard-fail so we never scrape from
+          # the raw runner IP (Facebook serves a 342KB block shell to it).
+          TRACE=$(curl -s -x socks5h://127.0.0.1:40000 --max-time 15 https://cloudflare.com/cdn-cgi/trace)
+          echo "$TRACE" | grep -E "warp=|ip=" || true
+          if ! echo "$TRACE" | grep -q "warp=on"; then
+            echo "::error::WARP proxy did not connect (warp=on missing in trace)"
+            exit 1
+          fi
+
+      - name: Run radar scraper
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_KEY: ${{ secrets.WORKER_KEY }}
+        run: node radar-scraper.mjs

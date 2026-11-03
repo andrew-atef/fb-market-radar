@@ -1,0 +1,30 @@
+# Cloudflare Workers configuration for Facebook Supermarket Monitor
+# Runs every 5 minutes via Cron Trigger, monitors Egyptian supermarket
+# Facebook pages via the Google Alerts Atom feed (free, keyless), shares
+# to a Facebook Page via Meta Graph API, stores state in D1, and serves
+# an admin dashboard.
+
+name = "facebook-supermarket-monitor"
+main = "src/index.ts"
+compatibility_date = "2026-10-31"
+
+# Enable Node.js compatibility for broader API surface
+compatibility_flags = ["nodejs_compat"]
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "facebook-monitor-db"
+# database_id is populated automatically after running `wrangler d1 create`
+# and applying the migration. Copy the output ID here.
+database_id = "52a28e2d-77e9-4537-a88a-9c430159d3b3"
+
+# Cron Trigger: every 5 minutes
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+# No runtime config vars needed; all secrets are set via `wrangler secret put`
+
+[observability]
+enabled = true
