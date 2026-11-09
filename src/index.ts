@@ -62,6 +62,47 @@ function hookLatencyMinutes(iso: string | null | undefined): number | null {
   return minutes;
 }
 
+/**
+ * Canonical, host- and rendition-independent photo signature from any
+ * Facebook CDN URL (e.g. "897643120_1060487087048492_...24246_n.png").
+ * Null when the URL carries no Facebook CDN signature.
+ */
+function photoSignature(url: string): string | null {
+  const m = /(\d{9,20}_\d{9,40}_\d{9,40}_n\.[a-z0-9]+)/i.exec(url);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Union of image lists keyed by photo signature, preserving the ORDER of
+ * the first list in which each URL appeared. The radar/SSR list is passed
+ * first because it is ordered and authoritative; Graph-API attachment
+ * copies (re-uploads with different photo ids) fill in only real extras.
+ */
+function unionImagesBySignature(...lists: string[][]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const url of list) {
+      if (typeof url !== "string" || !url.startsWith("http")) continue;
+      const key = photoSignature(url) ?? url;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(url);
+    }
+  }
+  return out;
+}
+
+function parseStoredImages(imagesJson: string | null): string[] {
+  try {
+    const parsed = imagesJson ? (JSON.parse(imagesJson) as unknown) : [];
+    return Array.isArray(parsed) ? parsed.filter((u): u is string => typeof u === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 
 /**
  * Fetches the shared-post attachments with patient retries:
@@ -227,7 +268,12 @@ export async function runSyncPipeline(env: Env): Promise<SyncResult> {
 
       let forwardedToLaravel = 0;
       let laravelStatus = "Local Only";
-      if (env.LARAVEL_INGEST_URL) {
+      // Graph API caps a shared story's subattachments at 12 — an exactly-12 set is
+      // provably truncated. Hold the Laravel forward; the WARP radar's merge-upgrade
+      // hook will re-forward with the full set within ~10 minutes.
+      if (images.length === 12) {
+        laravelStatus = "Deferred: 12-cap provisional set (awaiting radar merge)";
+      } else if (env.LARAVEL_INGEST_URL) {
         try {
           const laravelRes = await forwardToLaravel(env, {
             retailerSlug: laravelSlug,
@@ -461,6 +507,19 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       return jsonError("Fields 'retailerSlug' and 'postId' are required", 400);
     }
 
+    // Radar payload images (ordered, Stage-C mediaset extraction = the post's own
+    // attachment set). Normalized once, BEFORE the dedupe branch, so an existing
+    // D1 entry can be upgraded when the incoming set is richer than what a
+    // previous Google-Alerts share stored (Graph API caps shared-story
+    // subattachments at 12 — see the 12-image truncation incident).
+    const incomingImages: string[] = Array.isArray(payload.imageUrls)
+      ? payload.imageUrls
+          .filter(
+            (u): u is string => typeof u === "string" && u.startsWith("http")
+          )
+          .slice(0, 80)
+      : [];
+
     const store = SUPERMARKET_STORES.find(
       (s) =>
         s.slug.toLowerCase() === slug.toLowerCase() ||
@@ -489,14 +548,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     if (existing) {
       // Backfill: upgrade previously-stored posts that have a shared post
       // but no canonical Graph attachment images yet.
-      let storedImages: string[] = [];
-      try {
-        storedImages = existing.images_json
-          ? (JSON.parse(existing.images_json) as string[])
-          : [];
-      } catch {
-        storedImages = [];
-      }
+      const storedImages = parseStoredImages(existing.images_json);
 
       if (existing.shared_post_id && storedImages.length === 0) {
         try {
@@ -524,6 +576,72 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             backfillErr
           );
         }
+      }
+
+      // --- MERGE-UPGRADE: radar payload is richer than the stored entry ---
+      // Compare by canonical photo signature: Graph-API subattachment copies of a
+      // shared story are RE-UPLOADS with different photo ids than the origin
+      // photos, and Graph caps them at 12. If the radar set has signatures the
+      // stored set lacks, upgrade D1 and (re)forward to Laravel so the strict
+      // merge in GatekeeperFacebookPostJob appends the missing pages.
+      const storedSigs = new Set(
+        storedImages.map(photoSignature).filter((s): s is string => !!s)
+      );
+      const upgradesCount = incomingImages.filter((u) => {
+        const sig = photoSignature(u);
+        return !sig || !storedSigs.has(sig);
+      }).length;
+
+      if (upgradesCount > 0 && incomingImages.length >= storedImages.length) {
+        const merged = unionImagesBySignature(incomingImages, storedImages);
+        let forwarded = false;
+        let laravelStatus = "Local Only";
+        if (env.LARAVEL_INGEST_URL) {
+          try {
+            const laravelRes = await forwardToLaravel(env, {
+              retailerSlug: store.slug,
+              postId,
+              postText:
+                typeof payload.postText === "string" ? payload.postText.trim() : "",
+              imageUrls: incomingImages,
+              publishedAt: payload.publishedAt || null,
+            });
+            forwarded = laravelRes.forwarded;
+            laravelStatus = laravelRes.statusText;
+          } catch (mergeForwardErr) {
+            console.error(
+              `[hook] Laravel forward on merge-upgrade failed for ${postId}:`,
+              mergeForwardErr
+            );
+            laravelStatus = "Error";
+          }
+        }
+        await env.DB
+          .prepare(
+            "UPDATE posts SET images_json = ?, forwarded_to_laravel = ?, laravel_status = ? WHERE id = ?"
+          )
+          .bind(
+            JSON.stringify(merged.slice(0, 80)),
+            forwarded ? 1 : (existing.forwarded_to_laravel ?? 0),
+            laravelStatus,
+            existing.id
+          )
+          .run();
+        console.log(
+          `[hook] Merge-upgrade for ${postId}: stored=${storedImages.length} incoming=${incomingImages.length} upgrades=${upgradesCount}, laravelForwarded=${forwarded}`
+        );
+        return json({
+          status: "DUPLICATE",
+          success: true,
+          duplicate: true,
+          postId,
+          sharedPostId: existing.shared_post_id,
+          imagesUpgraded: true,
+          storedImageCount: storedImages.length,
+          upgradedImageCount: merged.length,
+          forwardedToLaravel: forwarded || Boolean(existing.forwarded_to_laravel),
+          laravelStatus,
+        });
       }
 
       return json({
@@ -556,25 +674,22 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     }
 
     // --- Image pipeline ---
-    // Canonical source: the Graph API attachment graph of OUR OWN shared
-    // post (`fields=attachments,child_attachments`). This extracts the full
-    // album/subattachments directly from Facebook. If present, these are the
-    // exact, official photos of the post/album.
-    // The SSR master URLs extracted by the scraper act only as fallback.
-    const ssrImages = Array.isArray(payload.imageUrls)
-      ? payload.imageUrls
-          .filter(
-            (u): u is string => typeof u === "string" && u.startsWith("http")
-          )
-          .slice(0, 80)
-      : [];
+    // Canonical source: the Graph API attachment graph of OUR OWN shared post.
+    // KNOWN LIMITATION (12-image truncation incident): Graph API caps a shared
+    // story's subattachments at 12. The radar's SSR/Stage-C mediaset extraction is
+    // ordered and uncapped, so it is the PRIMARY source: the union below keeps
+    // radar's order and merges any Graph-only extras afterwards.
+    const ssrImages = incomingImages;
 
     let images: string[] = [];
     let imageSource = "none";
 
     if (sharedPostId) {
       const graphImages = await fetchSharedImagesWithRetry(env, sharedPostId);
-      if (graphImages.length > 0) {
+      if (graphImages.length > 0 && ssrImages.length > 0) {
+        images = unionImagesBySignature(ssrImages, graphImages);
+        imageSource = "radar+graph-union";
+      } else if (graphImages.length > 0) {
         images = graphImages;
         imageSource = "graph-attachments";
       } else if (ssrImages.length > 0) {
@@ -586,17 +701,27 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       imageSource = "ssr-fallback";
     }
 
+    // --- Deferred forwarding for the 12-cap pathological case ---
+    // If the ONLY image source is our own shared post's Graph attachments and it
+    // hit exactly the documented 12 cap, the set is provably incomplete. Hold the
+    // Laravel forward: the WARP radar delivers the full attachment set on its next
+    // cycle (≤10 min) and the merge-upgrade branch re-forwards with the real set,
+    // so the flyer is born complete instead of being truncated to 12 pages and
+    // later appended as a 30-page mixed flyer.
+    const isTwelveCapOnly = imageSource === "graph-attachments" && images.length === 12;
+
     const publishedSql = isoToSqlDateTime(payload.publishedAt ?? null);
     const latency = hookLatencyMinutes(payload.publishedAt ?? null);
 
-    // --- Forward to Laravel backend ingestion API ---
-    const laravelRes = await forwardToLaravel(env, {
-      retailerSlug: store.slug, // exact database slug (e.g. "kazyon", "bimmisr")
-      postId,
-      postText: postText || "",
-      imageUrls: images.length > 0 ? images : (ssrImages.length > 0 ? ssrImages : []),
-      publishedAt: payload.publishedAt || null,
-    });
+    const laravelRes = isTwelveCapOnly
+      ? { forwarded: false, statusText: "Deferred: 12-cap provisional set (awaiting radar merge)" }
+      : await forwardToLaravel(env, {
+          retailerSlug: store.slug, // exact database slug (e.g. "kazyon", "bimmisr")
+          postId,
+          postText: postText || "",
+          imageUrls: images.length > 0 ? images : (ssrImages.length > 0 ? ssrImages : []),
+          publishedAt: payload.publishedAt || null,
+        });
 
     const forwardedToLaravel = laravelRes.forwarded ? 1 : 0;
     const laravelStatus = laravelRes.statusText;
