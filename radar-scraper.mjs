@@ -330,37 +330,186 @@ export async function fetchUrlViaWarp(url, customHeaders = []) {
     ...customHeaders,
     url
   );
+  // Append an HTTP-status trailer so block detection can see real status
+  // codes without a second request (curl writes it after the body).
+  args.push("-w", "\n__CURL_HTTP_CODE__%{http_code}");
 
   const { stdout } = await execFileAsync("curl", args, {
     maxBuffer: 25 * 1024 * 1024,
     timeout: 30_000,
   });
-  return stdout;
+  const metaMatch = /\n__CURL_HTTP_CODE__(\d{3})\s*$/.exec(stdout);
+  fetchUrlViaWarp.lastStatus = metaMatch ? Number(metaMatch[1]) : 0;
+  return metaMatch ? stdout.slice(0, metaMatch.index) : stdout;
 }
 
 export async function fetchViaWarp(handle) {
   return fetchUrlViaWarp(`https://www.facebook.com/${handle}`);
 }
 
+/* ------------------------------------------------------------------ */
+/* 3.5 SELF-HEALING EGRESS: block detection + autonomous WARP rotation */
+/* ------------------------------------------------------------------ */
+
+const WARP_ROTATE_COOLDOWN_MS = 30_000;
+let lastWarpRotationAt = 0;
+
 /**
- * Application-level resilient fetch: known WARP transient drops (verified
- * across GitHub Actions runs 41651570483+) kill a single curl invocation
- * even with curl's own --retry. Retries the WHOLE fetch and rejects
- * suspiciously short bodies (error shells are 1.5-4KB).
+ * Classifies a fetched Facebook HTML payload as BLOCKED or healthy.
+ * Blocked signals (all verified live):
+ *   - HTTP 400+ status
+ *   - "<title>Error</title>" shell (FB's generic error page)
+ *   - undersized payload vs the URL's expected minimum
+ *     (the 342KB login/consent shell, 1.5-4KB error shells)
+ * NOTE: minBytes is URL-context-aware. Store root feeds and post permalinks
+ * run 860KB-1.1MB+ (min 500KB), but pcb mediaset pages legitimately run
+ * 410-500KB — a blanket 500KB floor would misclassify every healthy pcb
+ * fetch and rotate forever. PCB therefore uses a 350KB floor.
  */
-export async function fetchUrlViaWarpResilient(url, customHeaders = [], attempts = 3) {
-  let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const out = await fetchUrlViaWarp(url, customHeaders);
-      if (out && out.length > 8000) return out; // real SSR payload, not a shell
-      lastErr = new Error(`suspiciously short body (${out ? out.length : 0}B)`);
-    } catch (err) {
-      lastErr = err;
-    }
-    if (i < attempts - 1) await sleep(2000 * (i + 1));
+export function classifyWarpResponse(html, { minBytes = 500_000 } = {}) {
+  if (!html || html.length === 0) {
+    return { blocked: true, reason: "empty response" };
   }
-  throw lastErr;
+  const status = fetchUrlViaWarp.lastStatus || 0;
+  if (status >= 400) {
+    return { blocked: true, reason: `HTTP ${status}` };
+  }
+  if (/<title>\s*Error\s*<\/title>/i.test(html.slice(0, 5000))) {
+    return { blocked: true, reason: "error shell (<title>Error</title>)" };
+  }
+  if (html.length < minBytes) {
+    return {
+      blocked: true,
+      reason: `undersized payload (${html.length}B < ${minBytes}B floor)`,
+    };
+  }
+  return { blocked: false, reason: "healthy" };
+}
+
+/**
+ * ZERO-PROMPT WARP identity rotation. Always passes --accept-tos so
+ * warp-cli never hangs on the interactive [y/N] agreement prompt in
+ * headless/systemd mode. Verifies the new egress via the Cloudflare trace
+ * through the SOCKS5 proxy; retries connect once if warp=on is not
+ * confirmed. No-ops when RADAR_DIRECT=1 (no proxy in play) or when the
+ * rotation happened less than WARP_ROTATE_COOLDOWN_MS ago.
+ *
+ * @returns {Promise<boolean>} true when warp=on was re-verified
+ */
+export async function rotateWarpEgress() {
+  if (RADAR_DIRECT) {
+    console.warn("[radar] RADAR_DIRECT=1: WARP rotation not applicable.");
+    return false;
+  }
+  const since = Date.now() - lastWarpRotationAt;
+  if (since < WARP_ROTATE_COOLDOWN_MS) {
+    console.log(
+      `[radar] Rotation cooldown active (${Math.round(since / 1000)}s/${Math.round(WARP_ROTATE_COOLDOWN_MS / 1000)}s); reusing current IP.`
+    );
+    return true;
+  }
+  lastWarpRotationAt = Date.now();
+
+  for (let round = 0; round < 2; round++) {
+    try {
+      await execFileAsync("warp-cli", ["--accept-tos", "disconnect"], {
+        timeout: 20_000,
+      });
+      await sleep(2000);
+      await execFileAsync("warp-cli", ["--accept-tos", "connect"], {
+        timeout: 20_000,
+      });
+      await sleep(3000);
+      // Verify the new egress through the proxy.
+      let verified = false;
+      for (let t = 0; t < 3 && !verified; t++) {
+        try {
+          const { stdout } = await execFileAsync(
+            "curl",
+            ["-s", "-x", WARP_PROXY, "--max-time", "10", "https://cloudflare.com/cdn-cgi/trace"],
+            { timeout: 15_000 }
+          );
+          verified = /warp=on/.test(stdout);
+        } catch {
+          /* trace probe failed; retry below */
+        }
+        if (!verified && t < 2) {
+          await sleep(2000);
+          try {
+            await execFileAsync("warp-cli", ["--accept-tos", "connect"], {
+              timeout: 20_000,
+            });
+          } catch {
+            /* connect retry; loop verifies again */
+          }
+          await sleep(3000);
+        }
+      }
+      if (verified) {
+        console.log("[radar] WARP rotation complete: fresh egress verified (warp=on).");
+        return true;
+      }
+      console.warn("[radar] WARP rotation round failed to verify warp=on; retrying...");
+    } catch (err) {
+      console.warn(`[radar] WARP rotation error: ${err.message}`);
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * IN-FLIGHT BLOCK DETECTION & AUTO-RETRY with WARP IP rotation.
+ *
+ * Wraps fetchUrlViaWarp: classifies the payload BEFORE it reaches the
+ * extraction layers; if Facebook is blocking/throttling this egress IP
+ * (HTTP 400+, error shell, undersized payload) or curl died on a
+ * network/proxy error, rotates the WARP identity autonomously and retries
+ * on the fresh IP. Up to `rotations` rotation retries per call.
+ *
+ * Empirical basis: a flagged egress IP serves ~342KB consent shells /
+ * error pages; rotating WARP (disconnect → connect) immediately restores
+ * the full 1.1MB HTTP/2 200 SSR responses.
+ */
+export async function fetchUrlViaWarpAuto(
+  url,
+  { minBytes = 500_000, rotations = 2, customHeaders = [] } = {}
+) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= rotations; attempt++) {
+    try {
+      const html = await fetchUrlViaWarp(url, customHeaders);
+      const verdict = classifyWarpResponse(html, { minBytes });
+      if (!verdict.blocked) {
+        if (attempt > 0) {
+          console.log(
+            `[radar] Auto-healing succeeded! Acquired clean IP (${html.length}B). Proceeding...`
+          );
+        }
+        return html;
+      }
+      lastError = new Error(verdict.reason);
+      console.warn(
+        `[radar] Egress block detected on ${url} (${html.length}B: ${verdict.reason}). Auto-healing: rotating WARP IP...`
+      );
+    } catch (err) {
+      lastError = err;
+      console.warn(
+        `[radar] Fetch error on ${url} (${err.message}). Auto-healing: rotating WARP IP...`
+      );
+    }
+    if (attempt < rotations) {
+      await rotateWarpEgress();
+    }
+  }
+
+  // Best-effort final plain attempt (rotation exhausted or unavailable).
+  try {
+    return await fetchUrlViaWarp(url, customHeaders);
+  } catch (err) {
+    throw lastError || err;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -545,7 +694,9 @@ export async function harvestPostImagesWaterfall(store, meta, rootHtml) {
   if (pcbCandidate) {
     try {
       const pcbUrl = `https://www.facebook.com/media/set/?set=pcb.${pcbCandidate}`;
-      const pcbHtml = await fetchUrlViaWarpResilient(pcbUrl);
+      // PCB mediaset pages legitimately run 410-500KB — the 350KB floor
+      // distinguishes healthy pages from the 342KB consent/error shells.
+      const pcbHtml = await fetchUrlViaWarpAuto(pcbUrl, { minBytes: 350_000 });
       if (pcbHtml && pcbHtml.length > 2000) {
         // (a) Mediaset edges: VERIFIED (photoFbid → rendition) pairs.
         const edges = extractMediasetEdges(pcbHtml);
@@ -585,7 +736,7 @@ export async function harvestPostImagesWaterfall(store, meta, rootHtml) {
   if (meta.postId) {
     try {
       const permalinkUrl = `https://www.facebook.com/${store.handle}/posts/${meta.postId}`;
-      const permalinkHtml = await fetchUrlViaWarpResilient(permalinkUrl);
+      const permalinkHtml = await fetchUrlViaWarpAuto(permalinkUrl, { minBytes: 500_000 });
       if (permalinkHtml && permalinkHtml.length > 2000) {
         // Re-extract metadata ON the permalink: the story token and
         // boundaries live there (the root feed HTML may not carry them).
@@ -775,7 +926,12 @@ export async function main() {
     if (i > 0) await sleep(INTER_STORE_DELAY_MS);
 
     try {
-      const rootHtml = await fetchViaWarp(store.handle);
+      // Root feed fetch with self-healing: a flagged egress IP serves
+      // consent/error shells instead of the ~1.1MB SSR feed; rotating the
+      // WARP identity immediately restores it.
+      const rootHtml = await fetchUrlViaWarpAuto(`https://www.facebook.com/${store.handle}`, {
+        minBytes: 500_000,
+      });
       const meta = extractPostMetadata(rootHtml);
 
       if (!meta || !meta.postId) {
@@ -914,7 +1070,7 @@ async function runBenchmark(permalink) {
       name: handle,
     };
 
-  const permalinkHtml = await fetchUrlViaWarp(permalink);
+  const permalinkHtml = await fetchUrlViaWarpAuto(permalink, { minBytes: 500_000 });
   console.log(`Permalink fetch: ${permalinkHtml.length} bytes`);
 
   const meta = extractPostMetadata(permalinkHtml);
@@ -936,8 +1092,9 @@ async function runBenchmark(permalink) {
   let edges = 0;
   let pcbPurified = [];
   if (meta.pcbToken) {
-    const pcbHtml = await fetchUrlViaWarp(
-      `https://www.facebook.com/media/set/?set=pcb.${meta.pcbToken}`
+    const pcbHtml = await fetchUrlViaWarpAuto(
+      `https://www.facebook.com/media/set/?set=pcb.${meta.pcbToken}`,
+      { minBytes: 350_000 }
     );
     edges = extractMediasetEdges(pcbHtml).length;
     pcbPurified = purifyImages(
