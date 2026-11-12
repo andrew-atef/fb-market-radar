@@ -18,6 +18,7 @@ import {
   shareToFacebookPage,
   fetchPostAttachments,
   fetchOriginPostImages,
+  fetchStoryPhotoMasters,
 } from "./services/facebook";
 import {
   renderDashboard,
@@ -60,38 +61,6 @@ function hookLatencyMinutes(iso: string | null | undefined): number | null {
   const minutes = Math.round((Date.now() - ms) / 60_000);
   if (minutes < 0 || minutes > 43_200) return null;
   return minutes;
-}
-
-/**
- * Canonical, host- and rendition-independent photo signature from any
- * Facebook CDN URL (e.g. "897643120_1060487087048492_...24246_n.png").
- * Null when the URL carries no Facebook CDN signature.
- */
-function photoSignature(url: string): string | null {
-  const m = /(\d{9,20}_\d{9,40}_\d{9,40}_n\.[a-z0-9]+)/i.exec(url);
-  return m ? m[1].toLowerCase() : null;
-}
-
-/**
- * Union of image lists keyed by photo signature, preserving the ORDER of
- * the first list in which each URL appeared. The radar/SSR list is passed
- * first because it is ordered and authoritative; Graph-API attachment
- * copies (re-uploads with different photo ids) fill in only real extras.
- */
-function unionImagesBySignature(...lists: string[][]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const list of lists) {
-    if (!Array.isArray(list)) continue;
-    for (const url of list) {
-      if (typeof url !== "string" || !url.startsWith("http")) continue;
-      const key = photoSignature(url) ?? url;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(url);
-    }
-  }
-  return out;
 }
 
 function parseStoredImages(imagesJson: string | null): string[] {
@@ -258,37 +227,13 @@ export async function runSyncPipeline(env: Env): Promise<SyncResult> {
           ? toSqlDateTime(new Date(pollTime.getTime() - ageMinutes * 60_000))
           : null;
 
-      const matchedStore = SUPERMARKET_STORES.find(
-        (s) =>
-          s.slug.toLowerCase() === item.storeSlug.toLowerCase() ||
-          s.handle.toLowerCase() === item.storeSlug.toLowerCase() ||
-          (s.facebookPage && s.facebookPage.toLowerCase() === item.storeSlug.toLowerCase())
-      );
-      const laravelSlug = matchedStore?.slug || item.storeSlug;
-
-      let forwardedToLaravel = 0;
-      let laravelStatus = "Local Only";
-      // Graph API caps a shared story's subattachments at 12 — an exactly-12 set is
-      // provably truncated. Hold the Laravel forward; the WARP radar's merge-upgrade
-      // hook will re-forward with the full set within ~10 minutes.
-      if (images.length === 12) {
-        laravelStatus = "Deferred: 12-cap provisional set (awaiting radar merge)";
-      } else if (env.LARAVEL_INGEST_URL) {
-        try {
-          const laravelRes = await forwardToLaravel(env, {
-            retailerSlug: laravelSlug,
-            postId: item.postId,
-            postText: item.snippet || item.title || "",
-            imageUrls: images,
-            publishedAt: postPublishedAt,
-          });
-          forwardedToLaravel = laravelRes.forwarded ? 1 : 0;
-          laravelStatus = laravelRes.statusText;
-        } catch (lErr) {
-          console.error(`[sync-pipeline] Laravel forward error:`, lErr);
-          laravelStatus = "Error";
-        }
-      }
+      // SINGLE SOURCE OF TRUTH (SSOT) ARCHITECTURE:
+      // Google Alerts is strictly demoted from ingestion authority.
+      // Alerts MUST NEVER forward partial Graph API attachments to Laravel directly.
+      // Instead, record the discovery in D1 as "pending_radar" so the VPS Radar
+      // can enrich and dispatch the complete purified album.
+      const forwardedToLaravel = 0;
+      const laravelStatus = "pending_radar";
 
       await env.DB
         .prepare(
@@ -546,112 +491,91 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }>();
 
     if (existing) {
-      // Backfill: upgrade previously-stored posts that have a shared post
-      // but no canonical Graph attachment images yet.
       const storedImages = parseStoredImages(existing.images_json);
+      const isPendingRadar = existing.laravel_status === "pending_radar" || !existing.forwarded_to_laravel;
+      const isRicher = incomingImages.length > storedImages.length;
 
-      if (existing.shared_post_id && storedImages.length === 0) {
-        try {
-          const graphImages = await fetchPostAttachments(
-            env,
-            existing.shared_post_id
-          );
-          await env.DB
-            .prepare("UPDATE posts SET images_json = ? WHERE id = ?")
-            .bind(JSON.stringify(graphImages.slice(0, 30)), existing.id)
-            .run();
-          return json({
-            status: "DUPLICATE",
-            success: true,
-            duplicate: true,
-            postId,
-            sharedPostId: existing.shared_post_id,
-            imagesBackfilled: graphImages.length,
-            forwardedToLaravel: Boolean(existing.forwarded_to_laravel),
-            laravelStatus: existing.laravel_status || "Local Only",
-          });
-        } catch (backfillErr) {
-          console.error(
-            `[hook] Image backfill failed for ${postId}:`,
-            backfillErr
-          );
-        }
-      }
-
-      // --- MERGE-UPGRADE: radar payload is richer than the stored entry ---
-      // Compare by canonical photo signature: Graph-API subattachment copies of a
-      // shared story are RE-UPLOADS with different photo ids than the origin
-      // photos, and Graph caps them at 12. If the radar set has signatures the
-      // stored set lacks, upgrade D1 and (re)forward to Laravel so the strict
-      // merge in GatekeeperFacebookPostJob appends the missing pages.
-      const storedSigs = new Set(
-        storedImages.map(photoSignature).filter((s): s is string => !!s)
-      );
-      const upgradesCount = incomingImages.filter((u) => {
-        const sig = photoSignature(u);
-        return !sig || !storedSigs.has(sig);
-      }).length;
-
-      if (upgradesCount > 0 && incomingImages.length >= storedImages.length) {
-        const merged = unionImagesBySignature(incomingImages, storedImages);
-        let forwarded = false;
-        let laravelStatus = "Local Only";
-        if (env.LARAVEL_INGEST_URL) {
-          try {
-            const laravelRes = await forwardToLaravel(env, {
-              retailerSlug: store.slug,
-              postId,
-              postText:
-                typeof payload.postText === "string" ? payload.postText.trim() : "",
-              imageUrls: incomingImages,
-              publishedAt: payload.publishedAt || null,
-            });
-            forwarded = laravelRes.forwarded;
-            laravelStatus = laravelRes.statusText;
-          } catch (mergeForwardErr) {
-            console.error(
-              `[hook] Laravel forward on merge-upgrade failed for ${postId}:`,
-              mergeForwardErr
-            );
-            laravelStatus = "Error";
-          }
-        }
-        await env.DB
-          .prepare(
-            "UPDATE posts SET images_json = ?, forwarded_to_laravel = ?, laravel_status = ? WHERE id = ?"
-          )
-          .bind(
-            JSON.stringify(merged.slice(0, 80)),
-            forwarded ? 1 : (existing.forwarded_to_laravel ?? 0),
-            laravelStatus,
-            existing.id
-          )
-          .run();
-        console.log(
-          `[hook] Merge-upgrade for ${postId}: stored=${storedImages.length} incoming=${incomingImages.length} upgrades=${upgradesCount}, laravelForwarded=${forwarded}`
-        );
+      // If already forwarded to Laravel and incoming set is not richer, mark as DUPLICATE.
+      if (!isPendingRadar && !isRicher) {
         return json({
           status: "DUPLICATE",
           success: true,
           duplicate: true,
           postId,
           sharedPostId: existing.shared_post_id,
-          imagesUpgraded: true,
-          storedImageCount: storedImages.length,
-          upgradedImageCount: merged.length,
-          forwardedToLaravel: forwarded || Boolean(existing.forwarded_to_laravel),
-          laravelStatus,
+          forwardedToLaravel: Boolean(existing.forwarded_to_laravel),
+          laravelStatus: existing.laravel_status || "Local Only",
         });
       }
 
+      // Ensure Facebook share exists
+      let sharedPostId = existing.shared_post_id;
+      if (!sharedPostId) {
+        const handle = store.handle || store.facebookPage;
+        const postUrl = `https://www.facebook.com/${handle}/posts/${postId}`;
+        const postText = typeof payload.postText === "string" ? payload.postText.trim() : "";
+        const message = `عروض جديدة من ${store.name} 🛒🔥\n\n${postText}`;
+        try {
+          sharedPostId = await shareToFacebookPage(env, postUrl, message);
+        } catch (shareErr) {
+          console.error(`[hook] Share failed for ${postId}:`, shareErr);
+        }
+      }
+
+      // SINGLE SOURCE OF TRUTH (SSOT) ENFORCEMENT:
+      // The VPS Radar is the EXCLUSIVE image authority. Its payload is
+      // already story-bound and purified (photo-id grouped, crops and
+      // cover/avatar renditions rejected). NEVER union it with images_json
+      // stored from Google Alerts — those are 720p Graph API previews of
+      // shared-story subattachments (capped at 12) and caused the
+      // resolution-multiplicity incident. Radar overwrites, wholesale:
+      const finalImages = incomingImages;
+      let forwarded = false;
+      let laravelStatus = "Local Only";
+
+      if (env.LARAVEL_INGEST_URL) {
+        try {
+          const laravelRes = await forwardToLaravel(env, {
+            retailerSlug: store.slug,
+            postId,
+            postText: typeof payload.postText === "string" ? payload.postText.trim() : "",
+            imageUrls: finalImages,
+            publishedAt: payload.publishedAt || null,
+          });
+          forwarded = laravelRes.forwarded;
+          laravelStatus = laravelRes.statusText;
+        } catch (forwardErr) {
+          console.error(`[hook] Laravel forward failed for ${postId}:`, forwardErr);
+          laravelStatus = "Error";
+        }
+      }
+
+      await env.DB
+        .prepare(
+          "UPDATE posts SET shared_post_id = COALESCE(shared_post_id, ?), images_json = ?, forwarded_to_laravel = ?, laravel_status = ? WHERE id = ?"
+        )
+        .bind(
+          sharedPostId,
+          JSON.stringify(finalImages.slice(0, 80)),
+          forwarded ? 1 : (existing.forwarded_to_laravel ?? 0),
+          laravelStatus,
+          existing.id
+        )
+        .run();
+
+      console.log(
+        `[hook] Radar enriched post ${postId} (${store.slug}): images=${finalImages.length}, forwarded=${forwarded}`
+      );
+
       return json({
-        status: "DUPLICATE",
+        status: "SUCCESS",
         success: true,
-        duplicate: true,
+        duplicate: false,
         postId,
-        sharedPostId: existing.shared_post_id,
-        forwardedToLaravel: Boolean(existing.forwarded_to_laravel),
-        laravelStatus: existing.laravel_status || "Local Only",
+        sharedPostId,
+        imageCount: finalImages.length,
+        forwardedToLaravel: forwarded,
+        laravelStatus,
       });
     }
 
@@ -670,61 +594,33 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         `[hook] Failed to share post ${postId} (${store.name}):`,
         shareErr
       );
-      // Still record the post — repro de-dupe must hold even if sharing failed.
     }
 
-    // --- Image pipeline ---
-    // Canonical source: the Graph API attachment graph of OUR OWN shared post.
-    // KNOWN LIMITATION (12-image truncation incident): Graph API caps a shared
-    // story's subattachments at 12. The radar's SSR/Stage-C mediaset extraction is
-    // ordered and uncapped, so it is the PRIMARY source: the union below keeps
-    // radar's order and merges any Graph-only extras afterwards.
-    const ssrImages = incomingImages;
-
-    let images: string[] = [];
-    let imageSource = "none";
-
-    if (sharedPostId) {
-      const graphImages = await fetchSharedImagesWithRetry(env, sharedPostId);
-      if (graphImages.length > 0 && ssrImages.length > 0) {
-        images = unionImagesBySignature(ssrImages, graphImages);
-        imageSource = "radar+graph-union";
-      } else if (graphImages.length > 0) {
-        images = graphImages;
-        imageSource = "graph-attachments";
-      } else if (ssrImages.length > 0) {
-        images = ssrImages;
-        imageSource = "ssr-fallback";
-      }
-    } else if (ssrImages.length > 0) {
-      images = ssrImages;
-      imageSource = "ssr-fallback";
-    }
-
-    // --- Deferred forwarding for the 12-cap pathological case ---
-    // If the ONLY image source is our own shared post's Graph attachments and it
-    // hit exactly the documented 12 cap, the set is provably incomplete. Hold the
-    // Laravel forward: the WARP radar delivers the full attachment set on its next
-    // cycle (≤10 min) and the merge-upgrade branch re-forwards with the real set,
-    // so the flyer is born complete instead of being truncated to 12 pages and
-    // later appended as a 30-page mixed flyer.
-    const isTwelveCapOnly = imageSource === "graph-attachments" && images.length === 12;
-
+    // Pure Router/Relay: The VPS Radar is the SSOT and has already purified all images.
+    const images = incomingImages;
+    const imageSource = "radar-ssot";
     const publishedSql = isoToSqlDateTime(payload.publishedAt ?? null);
     const latency = hookLatencyMinutes(payload.publishedAt ?? null);
 
-    const laravelRes = isTwelveCapOnly
-      ? { forwarded: false, statusText: "Deferred: 12-cap provisional set (awaiting radar merge)" }
-      : await forwardToLaravel(env, {
-          retailerSlug: store.slug, // exact database slug (e.g. "kazyon", "bimmisr")
+    let forwardedToLaravel = 0;
+    let laravelStatus = "Local Only";
+
+    if (env.LARAVEL_INGEST_URL) {
+      try {
+        const laravelRes = await forwardToLaravel(env, {
+          retailerSlug: store.slug,
           postId,
           postText: postText || "",
-          imageUrls: images.length > 0 ? images : (ssrImages.length > 0 ? ssrImages : []),
+          imageUrls: images,
           publishedAt: payload.publishedAt || null,
         });
-
-    const forwardedToLaravel = laravelRes.forwarded ? 1 : 0;
-    const laravelStatus = laravelRes.statusText;
+        forwardedToLaravel = laravelRes.forwarded ? 1 : 0;
+        laravelStatus = laravelRes.statusText;
+      } catch (err) {
+        console.error(`[hook] Laravel forward failed:`, err);
+        laravelStatus = "Error";
+      }
+    }
 
     await env.DB
       .prepare(
@@ -763,6 +659,54 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       forwardedToLaravel: Boolean(forwardedToLaravel),
       laravelStatus,
     });
+  }
+
+  // GET /api/radar/photos — Graph-API story ground truth for the VPS Radar.
+  //
+  // The Radar is the image SSOT, but anonymous SSR can only see the FIRST
+  // page of a multi-photo post's pcb mediaset. This endpoint lets the Radar
+  // CONSULT the complete story: our own page share mirrors the original
+  // post's full attachment set, and the page token reads every subattachment.
+  // The Radar merges these photo masters into its own purified set (photo-id
+  // grouped) — the Worker never injects images on its own initiative.
+  //
+  // Params: ?key=<DASHBOARD_AUTH_KEY> and either postId=<numeric original id>
+  // (shared_post_id resolved from D1) or sharedPostId=<page_id>_<post_id>.
+  if (path === "/api/radar/photos" && request.method === "GET") {
+    const postId = url.searchParams.get("postId");
+    let sharedPostId = url.searchParams.get("sharedPostId");
+
+    if (!sharedPostId && postId) {
+      const row = await env.DB
+        .prepare("SELECT shared_post_id FROM posts WHERE post_id = ?")
+        .bind(postId)
+        .first<{ shared_post_id: string | null }>();
+      sharedPostId = row?.shared_post_id ?? null;
+    }
+
+    if (!sharedPostId) {
+      return jsonError(
+        "No shared post available yet for this story (the page share is created on ingestion).",
+        404
+      );
+    }
+
+    try {
+      const photos = await fetchStoryPhotoMasters(env, sharedPostId);
+      return json({
+        success: true,
+        postId: postId || null,
+        sharedPostId,
+        photoCount: photos.length,
+        photos: photos.map((p) => ({ fbid: p.fbid, master: p.master })),
+      });
+    } catch (err) {
+      console.error(`[radar-photos] Graph ground truth failed:`, err);
+      return jsonError(
+        err instanceof Error ? err.message : "Graph ground truth failed",
+        502
+      );
+    }
   }
 
   // GET /api/stats

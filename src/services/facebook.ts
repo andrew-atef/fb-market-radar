@@ -162,6 +162,118 @@ export async function fetchPostAttachments(
 }
 
 /**
+ * Fetches the COMPLETE story photo set behind one of OUR OWN shared posts —
+ * the Graph-API ground truth for story-bound enrichment.
+ *
+ * Why: anonymous SSR scraping of a multi-photo post can only see the FIRST
+ * page of the post's own pcb mediaset (24 of e.g. 47 photos for El Fergany).
+ * Every other anonymous continuation channel is dead (GraphQL error shell,
+ * mbasic/m/touch unavailable, dialogs = login wall). But when the Worker
+ * shares the post to OUR page, Facebook mirrors the ORIGINAL post's FULL
+ * attachment set onto the share — and we own that share, so the page token
+ * reads every subattachment.
+ *
+ * Step 1 — enumerate photo fbids:
+ *   GET /{shared_post_id}?fields=attachments{media,subattachments.limit(100){media,target}}
+ * Step 2 — resolve each photo's MASTER rendition:
+ *   GET /?ids=<fbids>[,fbids...]&fields=images{source,width,height}
+ *   (batched 50 ids per call; `images.source` is the unconstrained master)
+ *
+ * @param env          - Worker environment bindings
+ * @param sharedPostId - Our page's share of the story ({page_id}_{post_id})
+ * @returns Array of { fbid, master } photo records
+ */
+export interface StoryPhotoMaster {
+  fbid: string;
+  master: string;
+  width?: number;
+  height?: number;
+}
+
+export async function fetchStoryPhotoMasters(
+  env: Env,
+  sharedPostId: string
+): Promise<StoryPhotoMaster[]> {
+  // --- Step 1: enumerate the story's photo fbids from the share ---
+  const attUrl = `${GRAPH_BASE}/${encodeURIComponent(sharedPostId)}`;
+  const attParams = new URLSearchParams();
+  attParams.set(
+    "fields",
+    "attachments{media,subattachments.limit(100){media,target}}"
+  );
+  attParams.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
+
+  const attResponse = await fetch(`${attUrl}?${attParams.toString()}`, {
+    headers: { Accept: "application/json" },
+  });
+  if (!attResponse.ok) {
+    const errorBody = await attResponse.text();
+    throw new Error(
+      `Facebook shared-post attachments error: ${attResponse.status} ${errorBody}`
+    );
+  }
+  const attData = (await attResponse.json()) as PostAttachmentsResponse;
+
+  const fbids = new Set<string>();
+  for (const att of attData.attachments?.data ?? []) {
+    for (const sub of att.subattachments?.data ?? []) {
+      const tid = sub.target?.id;
+      if (tid && /^\d{10,20}$/.test(tid)) fbids.add(tid);
+    }
+  }
+  if (fbids.size === 0) return [];
+
+  // --- Step 2: batch-resolve each photo's master rendition ---
+  const idList = [...fbids];
+  const masters: StoryPhotoMaster[] = [];
+  for (let i = 0; i < idList.length; i += 50) {
+    const chunk = idList.slice(i, i + 50);
+    const imgParams = new URLSearchParams();
+    imgParams.set("ids", chunk.join(","));
+    imgParams.set("fields", "images{source,width,height}");
+    imgParams.set("access_token", env.FB_PAGE_ACCESS_TOKEN);
+
+    const imgResponse = await fetch(`${GRAPH_BASE}/?${imgParams.toString()}`, {
+      headers: { Accept: "application/json" },
+    });
+    if (!imgResponse.ok) {
+      const errorBody = await imgResponse.text();
+      throw new Error(
+        `Facebook photo images error: ${imgResponse.status} ${errorBody}`
+      );
+    }
+    const imgData = (await imgResponse.json()) as Record<
+      string,
+      {
+        images?: Array<{ source?: string; width?: number; height?: number }>;
+      }
+    >;
+
+    for (const fbid of chunk) {
+      const images = imgData[fbid]?.images ?? [];
+      // `images` lists every rendition; the widest entry is the master.
+      let best: { source: string; width: number } | null = null;
+      for (const img of images) {
+        if (!img.source) continue;
+        if (!best || (img.width ?? 0) > best.width) {
+          best = { source: img.source, width: img.width ?? 0 };
+        }
+      }
+      if (best) {
+        masters.push({
+          fbid,
+          master: best.source,
+          width: best.width,
+          height: undefined,
+        });
+      }
+    }
+  }
+
+  return masters;
+}
+
+/**
  * Fetches the ORIGINAL downstream post's preview image via the public
  * OpenGraph meta tags (og:image).
  *
