@@ -119,7 +119,15 @@ export function scoreUrl(url) {
   if (/t39\.30808-1\//i.test(url)) return 0;
   if (/mx2048|s2048x2048|t39\.(?:99422|30808)-6\//i.test(url)) return 100;
   if (/mx1080|s1080x1080|s960x960|p720x720/i.test(url)) return 50;
-  if (/s552x414|s320x320|s150x150|p180x540/i.test(url)) return 0;
+  // Compressed previews, grid crops and video poster frames: NEVER flyer
+  // pages (production corruption 2026-11-12: s720x720 / s552x414 previews
+  // ingested instead of 2K masters; /m1/v/t6/ reel poster frames).
+  if (
+    /s720x720|s552x414|s320x320|p240x240|s150x150|s100x100|s75x75|s50x50|p50x50|p180x540/i.test(
+      url
+    )
+  )
+    return 0;
   return 20; // default for other scontent URLs
 }
 
@@ -258,6 +266,30 @@ export function purifyImages(
   const rejectedPhotoIds = rejected.rejectedPhotoIds || new Set();
   const restrictToAliased = Boolean(opts.restrictToAliased);
 
+  // VIDEO/REEL poster-frame and UI-asset markers: IMMEDIATE DISCARD.
+  // Production corruption 2026-11-12 (El Fergany): reel poster frames
+  // (/m1/v/t6/) were ingested as flyer pages.
+  const VIDEO_MARKERS = [
+    "/m1/v/t6/",
+    "/v/t6/",
+    "/v/t15/",
+    "video_thumb",
+    "t42.1790-2", // classic video frame family
+    "t6.27914", // modern video poster family
+    "emoji.php",
+  ];
+
+  // Compressed previews / grid crops: NEVER flyer pages. Production
+  // corruption 2026-11-12 (Kazyon & Kheir Zaman): s720x720 and s552x414
+  // preview attachments captured instead of unconstrained 2K masters.
+  const LOWRES_MARKER = /s720x720|s552x414|s320x320|p240x240|s150x150|s100x100|s75x75|s50x50|p50x50/i;
+
+  // STRICT RESOLUTION FLOOR: master classes ONLY. A URL qualifies as a
+  // flyer page iff it belongs to an unconstrained photo family
+  // (t39.30808-6 / t39.99422-6 — the real photo masters regardless of
+  // rendition params) or carries an explicit 2K/1080p master token.
+  const MASTER_CLASS = /t39\.(?:30808|99422)-6|mx2048|s2048x2048|mx1080|s1080x1080/i;
+
   const byId = new Map();
   const order = [];
 
@@ -266,7 +298,16 @@ export function purifyImages(
     const cleanUrl = raw.replace(/\\\//g, "/").replace(/&amp;/g, "&");
 
     // Tiny UI avatars and low-res thumbnails: never flyer pages.
-    if (/t39\.30808-1\/|s50x50|s150x150|p50x50/i.test(cleanUrl)) continue;
+    if (/t39\.30808-1\//i.test(cleanUrl)) continue;
+
+    // VIDEO/REEL frames and UI assets: strictly discarded.
+    if (VIDEO_MARKERS.some((m) => cleanUrl.includes(m))) continue;
+
+    // Low-resolution previews / grid crops: strictly discarded.
+    if (LOWRES_MARKER.test(cleanUrl)) continue;
+
+    // Master-class requirement: unconstrained 2K/1080p renditions only.
+    if (!MASTER_CLASS.test(cleanUrl)) continue;
 
     const canonicalId = photoCanonicalId(cleanUrl);
     const sig = photoSignature(cleanUrl);
@@ -516,6 +557,68 @@ export async function fetchUrlViaWarpAuto(
 /* 4. Post Metadata Extraction                                        */
 /* ------------------------------------------------------------------ */
 
+/**
+ * VIDEO/REEL REJECTION SHIELD.
+ *
+ * Facebook video and reel posts are NOT printable flyers: their CDN assets
+ * are poster frames / thumbnails (families /m1/v/t6/, /v/t6/, /v/t15/),
+ * not photo masters. Production corruption 2026-11-12 (El Fergany): a reel
+ * post was ingested as a single-frame flyer.
+ *
+ * Signals (proven live):
+ *   - postId-anchored (SUFFICIENT alone): watch/?v=<postId>, /videos/<postId>,
+ *     "video_id":"<postId>", "videoId":"<postId>"
+ *   - typed media nodes within the post's OWN story block (postIdIndex up to
+ *     the next DIFFERENT post_id — never the whole document, which carries
+ *     unrelated feed content): "__typename":"Video"/"Reel", "is_video":true,
+ *     "playback_video", watch/reel links
+ */
+export function detectVideoPost(html, postId, postIdIndex) {
+  if (!html || typeof html !== "string" || !postId) {
+    return { isVideo: false, signals: [] };
+  }
+  const clean = html.replace(/\\\//g, "/");
+  const signals = [];
+  const isNumeric = /^\d+$/.test(postId);
+
+  // Post-own story block boundary (same rule as extractStoryWindowUrls).
+  let winEnd = postIdIndex >= 0 ? postIdIndex + 600_000 : clean.length;
+  if (postIdIndex >= 0) {
+    for (const m of clean.matchAll(/"post_id":"(\d{10,})"/g)) {
+      if (m.index > postIdIndex && m[1] !== postId) {
+        winEnd = Math.min(winEnd, m.index);
+        break;
+      }
+    }
+  }
+  const win = clean.slice(postIdIndex >= 0 ? postIdIndex : 0, winEnd);
+
+  // postId-anchored signals — sufficient alone because they name THIS post.
+  if (isNumeric) {
+    if (new RegExp(`watch/?\\?v=${postId}`).test(clean)) signals.push("watch_url");
+    if (new RegExp(`/videos/${postId}([^0-9]|$)`).test(clean)) signals.push("videos_url");
+    if (new RegExp(`"video_id":"${postId}"`).test(win)) signals.push("video_id");
+    if (new RegExp(`"videoId":"${postId}"`).test(win)) signals.push("videoId");
+  }
+
+  // Typed media signals — only trusted WITHIN the post's own story block.
+  if (/"__typename":"(?:Video|Reel)"/.test(win)) signals.push("typename_video_or_reel");
+  if (/"is_video"\s*:\s*true/.test(win)) signals.push("is_video_true");
+  if (/"playback_video"/.test(win)) signals.push("playback_video");
+  if (/facebook\.com\/(?:watch|reel)\//.test(win)) signals.push("watch_or_reel_link");
+
+  const anchored = ["watch_url", "videos_url", "video_id", "videoId"].some((s) =>
+    signals.includes(s)
+  );
+  const typedPair =
+    signals.includes("typename_video_or_reel") &&
+    (signals.includes("is_video_true") ||
+      signals.includes("playback_video") ||
+      signals.includes("watch_or_reel_link"));
+
+  return { isVideo: anchored || typedPair, signals };
+}
+
 export function extractPostMetadata(html) {
   if (!html || html.length < 1000) return null;
 
@@ -585,7 +688,21 @@ export function extractPostMetadata(html) {
       ? postIdIndex
       : -1;
 
-  return { postId, publishedAt, text, pcbToken, albumId, postIdIndex, storyIndex };
+  // VIDEO/REEL REJECTION SHIELD: video and reel posts are not printable
+  // flyers; flag them so callers skip dispatch entirely.
+  const videoCheck = detectVideoPost(html, postId, postIdIndex);
+
+  return {
+    postId,
+    publishedAt,
+    text,
+    pcbToken,
+    albumId,
+    postIdIndex,
+    storyIndex,
+    isVideo: videoCheck.isVideo,
+    videoSignals: videoCheck.signals,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -742,6 +859,25 @@ export async function harvestPostImagesWaterfall(store, meta, rootHtml) {
         // boundaries live there (the root feed HTML may not carry them).
         const permMeta =
           extractPostMetadata(permalinkHtml) || meta;
+
+        // Authoritative VIDEO/REEL re-check on the permalink itself: reel
+        // permalinks redirect to /reel/ or /watch/, and the post's own
+        // attachment payload is fully present here. If the root feed
+        // missed it, the permalink does not.
+        if (permMeta.isVideo && !meta.isVideo) {
+          console.log(
+            `[radar] ${store.slug} Post ${meta.postId} is a VIDEO/REEL. Strictly skipping (not a printable flyer). [${permMeta.videoSignals.join(", ")}]`
+          );
+          return {
+            images: [],
+            tier: "SKIPPED_VIDEO_REEL",
+            detail: {
+              sources: ["VIDEO_REJECTION_SHIELD"],
+              signals: permMeta.videoSignals,
+            },
+          };
+        }
+
         const mergedMeta = {
           ...meta,
           pcbToken: meta.pcbToken || permMeta.pcbToken,
@@ -942,6 +1078,21 @@ export async function main() {
         continue;
       }
 
+      // VIDEO/REEL REJECTION SHIELD: never dispatch video poster frames as
+      // flyer pages.
+      if (meta.isVideo) {
+        summary.push({
+          store: store.slug,
+          status: "SKIP_VIDEO",
+          postId: meta.postId,
+          signals: meta.videoSignals,
+        });
+        console.log(
+          `[radar] ${store.slug} Post ${meta.postId} is a VIDEO/REEL. Strictly skipping (not a printable flyer). [${meta.videoSignals.join(", ")}]`
+        );
+        continue;
+      }
+
       const ageHours = meta.publishedAt
         ? (Date.now() - Date.parse(meta.publishedAt)) / 3_600_000
         : null;
@@ -960,6 +1111,14 @@ export async function main() {
 
       // Execute Strict 4-Tier Waterfall Extraction
       const { images, tier } = await harvestPostImagesWaterfall(store, meta, rootHtml);
+
+      if (!images || images.length === 0) {
+        summary.push({ store: store.slug, status: "SKIP_NO_IMAGES", postId: meta.postId, tier });
+        console.log(
+          `[radar] ${store.slug.padEnd(20)} SKIP_NO_IMAGES ${meta.postId} | ${tier} (0 purified masters — nothing printable to dispatch)`
+        );
+        continue;
+      }
 
       const postPayload = {
         postId: meta.postId,
@@ -1077,6 +1236,13 @@ async function runBenchmark(permalink) {
   if (!meta || !meta.postId) {
     console.error("FATAL: no post metadata extracted from permalink.");
     process.exit(1);
+  }
+  if (meta.isVideo) {
+    console.log(`Post ID       : ${meta.postId}`);
+    console.log(`VIDEO SHIELD  : ENGAGED — post is a VIDEO/REEL. Strictly skipping.`);
+    console.log(`Signals       : ${meta.videoSignals.join(", ")}`);
+    console.log(`=== BENCHMARK COMPLETE (VIDEO/REEL REJECTED) ===\n`);
+    return;
   }
   console.log(`Post ID       : ${meta.postId}`);
   console.log(`Publish Time  : ${meta.publishedAt}`);
