@@ -4,38 +4,33 @@
  * Run on the VPS (or locally with RADAR_DIRECT=1):
  *   node verify-guards.mjs
  *
- * Verifies the three structural guards added to radar-scraper.mjs after the
+ * Verifies the structural guards added to radar-scraper.mjs after the
  * 2026-11-12 corrupted-flyer investigation:
  *   GUARD A — purification gate: video/reel poster frames and low-res
  *             previews are discarded; only 2K/1080p master classes pass.
  *   GUARD B — video shield (LIVE): the El Fergany reel post is detected as
- *             VIDEO/REEL and strictly skipped.
+ *             VIDEO/REEL and strictly skipped, root-feed blind or not.
  *   GUARD C — regression (LIVE): genuine multi-photo catalogs still yield
  *             their full ground-truth sets (HyperOne = 6, El Fergany = 48).
+ *
+ * IMPORTANT ORDERING: radar-scraper.mjs captures WORKER_URL/WORKER_KEY at
+ * module-load time. The radar.env bootstrap MUST run BEFORE the scraper is
+ * imported, hence the dynamic import below (a static import would evaluate
+ * first and leave the Graph ground-truth tier blind — that was the cause of
+ * the "El Fergany 24 vs 48" harness failure on the VPS).
  *
  * Exit code 0 = ALL GUARDS PASS; 1 = at least one guard FAILED.
  */
 
-import {
-  extractPostMetadata,
-  purifyImages,
-  harvestPostImagesWaterfall,
-  fetchUrlViaWarpAuto,
-} from "./radar-scraper.mjs";
-
-let failures = 0;
-
 /* ------------------------------------------------------------------ */
-/* Env bootstrap: pull WORKER_URL/WORKER_KEY from ./radar.env when the */
-/* shell did not export them (systemd loads radar.env via run.sh; a    */
-/* manual VPS run may not).                                            */
+/* 1. Env bootstrap FIRST (before the scraper import)                  */
 /* ------------------------------------------------------------------ */
 if (!process.env.WORKER_URL) {
   try {
     const fs = await import("node:fs");
     const envText = fs.readFileSync("./radar.env", "utf8");
     for (const line of envText.split(/\r?\n/)) {
-      const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+      const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
       if (!m) continue;
       const key = m[1];
       let value = m[2];
@@ -52,6 +47,18 @@ if (!process.env.WORKER_URL) {
     console.log("[verify] No ./radar.env — Graph ground-truth tier will be limited.");
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* 2. Scraper import (dynamic — after env bootstrap)                   */
+/* ------------------------------------------------------------------ */
+const {
+  extractPostMetadata,
+  purifyImages,
+  harvestPostImagesWaterfall,
+  fetchUrlViaWarpAuto,
+} = await import("./radar-scraper.mjs");
+
+let failures = 0;
 
 const okay = (name, detail) => {
   console.log(`  PASS  ${name}${detail ? ` — ${detail}` : ""}`);
@@ -78,6 +85,10 @@ console.log("\n=== GUARD A: PURIFICATION GATE (synthetic) ===");
     "https://scontent.fcai19-2.fna.fbcdn.net/v/t42.1790-2/123456789_987654324_112233448_n.jpg?_nc_cat=4",
     "https://scontent.fcai19-2.fna.fbcdn.net/v/t6.27914-2/video_thumb_123456789_987654325_112233449_n.jpg?_nc_cat=5",
     "https://www.facebook.com/emoji.php/v/1/emoji/emoji_one_v3.png",
+    // Reel thumbnail family (t15.5256-10): not a photo master family —
+    // excluded by the MASTER_CLASS whitelist even though /v/t15/ as a
+    // literal token does not match "/v/t15.5256-10/".
+    "https://scontent.fcai19-2.fna.fbcdn.net/v/t15.5256-10/902441724_1879070719758452_7575245292490711373_n.avif?stp=dst-jpg_tt6&_nc_cat=12",
     // Low-res previews / grid crops — MUST be discarded
     "https://scontent.fcai19-2.fna.fbcdn.net/v/t39.30808-6/123456789_987654331_112233451_n.jpg?stp=s720x720&_nc_cat=6",
     "https://scontent.fcai19-2.fna.fbcdn.net/v/t39.30808-6/123456789_987654332_112233452_n.jpg?stp=s552x414&_nc_cat=7",
@@ -91,14 +102,14 @@ console.log("\n=== GUARD A: PURIFICATION GATE (synthetic) ===");
   ];
   const purified = purifyImages(raws);
   const survivedVideo = purified.some((u) =>
-    /\/m1\/v\/t6\/|\/v\/t6\/|\/v\/t15\/|t42\.1790-2|t6\.27914|video_thumb|emoji\.php/.test(u)
+    /\/m1\/v\/t6\/|\/v\/t6\/|\/v\/t15\/|t42\.1790-2|t6\.27914|video_thumb|emoji\.php|t15\.5256/.test(u)
   );
   const survivedLowres = purified.some((u) =>
     /s720x720|s552x414|s320x320|p240x240|s100x100|s150x150|s50x50|p50x50/i.test(u)
   );
   const survivedLegit = purified.includes(legitMaster) && purified.includes(legitMaster1080);
   const onlyLegit = purified.length === 2 && survivedLegit;
-  if (!survivedVideo) okay("VIDEO_MARKERS rejected (all 7 video/UI assets discarded)");
+  if (!survivedVideo) okay("VIDEO_MARKERS rejected (all 8 video/UI assets discarded)");
   else bad("VIDEO_MARKERS rejection", `leaked: ${JSON.stringify(purified)}`);
   if (!survivedLowres) okay("LOWRES_MARKER rejected (all 6 compressed previews discarded)");
   else bad("LOWRES_MARKER rejection", `leaked: ${JSON.stringify(purified)}`);
@@ -112,8 +123,12 @@ console.log("\n=== GUARD A: PURIFICATION GATE (synthetic) ===");
 console.log("\n=== GUARD B: VIDEO/REEL SHIELD (live) ===");
 // The production corrupted flyer (2026-11-12): El Fergany's LATEST post on
 // the root feed is a reel — post 1551060330389769 (2026-11-11T18:59Z).
-// Note: posts/pfbid02PAccyXGKAjVqFXkhGiQVWmMe5RuCv6t4JMXFH5XpJ7TjAhZve5YmbB8jthAvih5Pl
+// Its own Video node id is 1766217484492277 (its comments link to
+// facebook.com/reel/1766217484492277). Note: posts/pfbid02PAccyXGKAjVqFXkhGiQVWmMe5RuCv6t4JMXFH5XpJ7TjAhZve5YmbB8jthAvih5Pl
 // canonicalizes to the 48-photo album post 1548563663972769, NOT to the reel.
+// Same verified-reel structure: seoudi 1133696949382206 (video 1752063485862706)
+// and hyperone 1593417299493252 (video 1172807188640244) — flagged correctly
+// in production run 2.
 const VIDEO_POST_URL = "https://www.facebook.com/marketelfergany/posts/1551060330389769";
 {
   try {
